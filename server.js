@@ -262,6 +262,21 @@ app.delete('/api/collectors/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// Mettre à jour le mot de passe d'un collecteur
+app.put('/api/collectors/:id/password', (req, res) => {
+  const { password } = req.body;
+  const collector = db.collectors.find(c => c.id === req.params.id || c.email === req.params.id);
+  
+  if (!collector) {
+    return res.json({ success: false, error: 'Collecteur non trouvé' });
+  }
+  
+  collector.password = bcrypt.hashSync(password, 10);
+  saveDB(db);
+  
+  res.json({ success: true });
+});
+
 // =============================================
 // ROUTES - OPÉRATEURS
 // =============================================
@@ -345,6 +360,21 @@ app.delete('/api/operators/:id', (req, res) => {
   }
   
   db.operators.splice(index, 1);
+  saveDB(db);
+  
+  res.json({ success: true });
+});
+
+// Mettre à jour le mot de passe d'un opérateur
+app.put('/api/operators/:id/password', (req, res) => {
+  const { password } = req.body;
+  const operator = db.operators.find(o => o.id === req.params.id || o.email === req.params.id);
+  
+  if (!operator) {
+    return res.json({ success: false, error: 'Opérateur non trouvé' });
+  }
+  
+  operator.password = bcrypt.hashSync(password, 10);
   saveDB(db);
   
   res.json({ success: true });
@@ -480,6 +510,21 @@ app.delete('/api/restaurants/:id', (req, res) => {
   }
   
   db.restaurants.splice(index, 1);
+  saveDB(db);
+  
+  res.json({ success: true });
+});
+
+// Mettre à jour le mot de passe d'un restaurant
+app.put('/api/restaurants/:id/password', (req, res) => {
+  const { password } = req.body;
+  const restaurant = db.restaurants.find(r => r.id === req.params.id || r.email === req.params.id);
+  
+  if (!restaurant) {
+    return res.json({ success: false, error: 'Restaurant non trouvé' });
+  }
+  
+  restaurant.password = password; // Non hashé pour les restaurants (comparaison directe)
   saveDB(db);
   
   res.json({ success: true });
