@@ -607,6 +607,39 @@ app.get('/api/statistics', (req, res) => {
 });
 
 // =============================================
+// ROUTES - PARAMÈTRES ADMIN
+// =============================================
+
+// Récupérer les paramètres
+app.get('/api/settings', (req, res) => {
+  // Initialiser settings si non existant
+  if (!db.settings) {
+    db.settings = {
+      email: 'contact@uco-and-co.com',
+      brevoApiKey: ''
+    };
+    saveDB(db);
+  }
+  res.json(db.settings);
+});
+
+// Mettre à jour les paramètres
+app.post('/api/settings', (req, res) => {
+  const { email, brevoApiKey } = req.body;
+  
+  if (!db.settings) {
+    db.settings = {};
+  }
+  
+  if (email !== undefined) db.settings.email = email;
+  if (brevoApiKey !== undefined) db.settings.brevoApiKey = brevoApiKey;
+  
+  saveDB(db);
+  
+  res.json({ success: true, settings: db.settings });
+});
+
+// =============================================
 // DÉMARRAGE DU SERVEUR
 // =============================================
 
