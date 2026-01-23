@@ -28,6 +28,8 @@ const initialDB = {
   restaurants: [],
   collections: [],
   tournees: [],
+  dailyVolumes: [],
+  expeditions: [],
   settings: {
     email: 'contact@uco-and-co.com',
     brevoApiKey: ''
@@ -662,6 +664,65 @@ app.put('/api/tournees/:id', (req, res) => {
 });
 
 // =============================================
+// ROUTES - VOLUMES JOURNALIERS
+// =============================================
+
+// Ajouter un volume journalier
+app.post('/api/daily-volumes', (req, res) => {
+  if (!db.dailyVolumes) db.dailyVolumes = [];
+  
+  const volume = {
+    id: req.body.id || uuidv4(),
+    ...req.body,
+    timestamp: new Date().toISOString()
+  };
+  
+  db.dailyVolumes.push(volume);
+  saveDB(db);
+  
+  res.json({ success: true, id: volume.id });
+});
+
+// Liste des volumes journaliers
+app.get('/api/daily-volumes', (req, res) => {
+  if (!db.dailyVolumes) db.dailyVolumes = [];
+  res.json(db.dailyVolumes.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
+});
+
+// Volumes par date
+app.get('/api/daily-volumes/:date', (req, res) => {
+  if (!db.dailyVolumes) db.dailyVolumes = [];
+  const volumes = db.dailyVolumes.filter(v => v.date === req.params.date);
+  res.json(volumes);
+});
+
+// =============================================
+// ROUTES - EXPÉDITIONS
+// =============================================
+
+// Ajouter une expédition
+app.post('/api/expeditions', (req, res) => {
+  if (!db.expeditions) db.expeditions = [];
+  
+  const expedition = {
+    id: req.body.id || uuidv4(),
+    ...req.body,
+    timestamp: new Date().toISOString()
+  };
+  
+  db.expeditions.push(expedition);
+  saveDB(db);
+  
+  res.json({ success: true, id: expedition.id });
+});
+
+// Liste des expéditions
+app.get('/api/expeditions', (req, res) => {
+  if (!db.expeditions) db.expeditions = [];
+  res.json(db.expeditions.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
+});
+
+// =============================================
 // ROUTES - STATISTIQUES
 // =============================================
 
@@ -683,7 +744,7 @@ app.get('/api/statistics', (req, res) => {
 // ROUTES - PARAMÈTRES ADMIN
 // =============================================
 
-// Récupérer les paramètres
+// Récupérer les paramètres (clé API masquée pour la sécurité)
 app.get('/api/settings', (req, res) => {
   // Initialiser settings si non existant
   if (!db.settings) {
@@ -693,7 +754,13 @@ app.get('/api/settings', (req, res) => {
     };
     saveDB(db);
   }
-  res.json(db.settings);
+  
+  // Retourner les paramètres avec la clé API masquée
+  res.json({
+    email: db.settings.email,
+    brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
+    hasBrevoKey: !!db.settings.brevoApiKey
+  });
 });
 
 // Mettre à jour les paramètres
@@ -705,11 +772,70 @@ app.post('/api/settings', (req, res) => {
   }
   
   if (email !== undefined) db.settings.email = email;
-  if (brevoApiKey !== undefined) db.settings.brevoApiKey = brevoApiKey;
+  // Ne mettre à jour la clé que si elle n'est pas masquée
+  if (brevoApiKey !== undefined && !brevoApiKey.startsWith('••••')) {
+    db.settings.brevoApiKey = brevoApiKey;
+  }
   
   saveDB(db);
   
-  res.json({ success: true, settings: db.settings });
+  res.json({ 
+    success: true, 
+    settings: {
+      email: db.settings.email,
+      brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
+      hasBrevoKey: !!db.settings.brevoApiKey
+    }
+  });
+});
+
+// =============================================
+// ROUTES - ENVOI D'EMAILS (Sécurisé côté serveur)
+// =============================================
+
+// Envoyer un email via Brevo (la clé API reste côté serveur)
+app.post('/api/send-email', async (req, res) => {
+  const { to, subject, htmlContent, senderName = 'UCO AND CO' } = req.body;
+  
+  if (!to || !subject || !htmlContent) {
+    return res.json({ success: false, error: 'Paramètres manquants (to, subject, htmlContent)' });
+  }
+  
+  const apiKey = db.settings?.brevoApiKey;
+  
+  if (!apiKey) {
+    console.warn('Clé API Brevo non configurée');
+    return res.json({ success: false, error: 'Clé API Brevo non configurée' });
+  }
+  
+  try {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: { name: senderName, email: 'contact@uco-and-co.fr' },
+        to: [{ email: to }],
+        subject: subject,
+        htmlContent: htmlContent
+      })
+    });
+    
+    if (response.ok) {
+      console.log('Email envoyé avec succès à', to);
+      res.json({ success: true });
+    } else {
+      const error = await response.json();
+      console.error('Erreur envoi email:', error);
+      res.json({ success: false, error: error.message || 'Erreur Brevo' });
+    }
+  } catch (error) {
+    console.error('Erreur envoi email:', error);
+    res.json({ success: false, error: error.message });
+  }
 });
 
 // =============================================
