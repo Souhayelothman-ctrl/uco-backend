@@ -165,7 +165,30 @@ app.post('/api/auth/restaurant', (req, res) => {
   
   const restaurant = db.restaurants.find(r => r.email === email && r.status === 'approved');
   
-  if (restaurant && restaurant.password && bcrypt.compareSync(password, restaurant.password)) {
+  if (!restaurant || !restaurant.password) {
+    return res.json({ success: false, error: 'Identifiants incorrects ou compte non approuvé' });
+  }
+  
+  // Vérifier le mot de passe (hashé avec bcrypt ou en clair pour la migration)
+  let passwordValid = false;
+  
+  // Essayer d'abord la comparaison bcrypt (mot de passe hashé)
+  try {
+    passwordValid = bcrypt.compareSync(password, restaurant.password);
+  } catch (e) {
+    // Si bcrypt échoue, le mot de passe n'est peut-être pas hashé
+    passwordValid = false;
+  }
+  
+  // Si bcrypt échoue, essayer la comparaison directe (anciens comptes non hashés)
+  if (!passwordValid && password === restaurant.password) {
+    passwordValid = true;
+    // Hasher le mot de passe pour les prochaines connexions
+    restaurant.password = bcrypt.hashSync(password, 10);
+    saveDB(db);
+  }
+  
+  if (passwordValid) {
     const { password: _, ...userData } = restaurant;
     res.json({ success: true, user: userData });
   } else {
@@ -386,7 +409,7 @@ app.put('/api/operators/:id/password', (req, res) => {
 
 // Inscription restaurant
 app.post('/api/restaurants/register', (req, res) => {
-  const { email, ...data } = req.body;
+  const { email, password, ...data } = req.body;
   
   if (db.restaurants.find(r => r.email === email)) {
     return res.json({ success: false, error: 'Email déjà utilisé' });
@@ -395,6 +418,7 @@ app.post('/api/restaurants/register', (req, res) => {
   const restaurant = {
     id: uuidv4(),
     email,
+    password: password ? bcrypt.hashSync(password, 10) : null, // Hasher le mot de passe
     ...data,
     status: 'pending',
     dateRequest: new Date().toISOString()
@@ -442,16 +466,20 @@ app.post('/api/restaurants/:id/approve', (req, res) => {
     return res.json({ success: false, error: 'Restaurant non trouvé' });
   }
   
+  // Extraire qrCode et password du body, le reste va dans updateData
   const { qrCode, password, ...updateData } = req.body;
   
+  // Sauvegarder le mot de passe existant avant l'update
+  const existingPassword = restaurant.password;
+  
+  // Mettre à jour les données du restaurant
   Object.assign(restaurant, updateData);
   restaurant.status = 'approved';
   restaurant.qrCode = qrCode || `UCO-${Date.now()}`;
   restaurant.dateApproval = new Date().toISOString();
   
-  if (password) {
-    restaurant.password = bcrypt.hashSync(password, 10);
-  }
+  // Restaurer le mot de passe existant (qui a été hashé lors de l'inscription)
+  restaurant.password = existingPassword;
   
   saveDB(db);
   
