@@ -119,6 +119,52 @@ app.get('/api/health', (req, res) => {
 });
 
 // =============================================
+// ROUTES - PROXY APIS GOUVERNEMENTALES
+// =============================================
+
+// Proxy pour l'API recherche entreprises (SIRET)
+app.get('/api/proxy/siret/:siret', async (req, res) => {
+  try {
+    const siret = req.params.siret.replace(/\D/g, '');
+    if (siret.length !== 14) {
+      return res.status(400).json({ error: 'SIRET invalide' });
+    }
+    
+    const response = await fetch(`https://recherche-entreprises.api.gouv.fr/search?q=${siret}&page=1&per_page=1`);
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'API non disponible' });
+    }
+    
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    console.error('Erreur proxy SIRET:', e.message);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Proxy pour l'API geo.api.gouv.fr (villes par code postal)
+app.get('/api/proxy/villes/:cp', async (req, res) => {
+  try {
+    const cp = req.params.cp.replace(/\D/g, '');
+    if (cp.length !== 5) {
+      return res.status(400).json({ error: 'Code postal invalide' });
+    }
+    
+    const response = await fetch(`https://geo.api.gouv.fr/communes?codePostal=${cp}&fields=nom&format=json`);
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'API non disponible' });
+    }
+    
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    console.error('Erreur proxy villes:', e.message);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// =============================================
 // ROUTES - AUTHENTIFICATION
 // =============================================
 
