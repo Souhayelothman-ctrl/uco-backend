@@ -517,17 +517,23 @@ app.post('/api/restaurants/:id/approve', (req, res) => {
   // Extraire qrCode et password du body, le reste va dans updateData
   const { qrCode, password, ...updateData } = req.body;
   
-  // Sauvegarder le mot de passe existant avant l'update
-  const existingPassword = restaurant.password;
-  
   // Mettre à jour les données du restaurant
   Object.assign(restaurant, updateData);
   restaurant.status = 'approved';
   restaurant.qrCode = qrCode || `UCO-${Date.now()}`;
   restaurant.dateApproval = new Date().toISOString();
   
-  // Restaurer le mot de passe existant (qui a été hashé lors de l'inscription)
-  restaurant.password = existingPassword;
+  // Gérer le mot de passe
+  // Si un nouveau mot de passe est fourni (mot de passe temporaire), le hasher et le stocker
+  if (password && !restaurant.password) {
+    // Le restaurant n'avait pas de mot de passe (créé par collecteur)
+    // Hasher le mot de passe temporaire
+    restaurant.password = bcrypt.hashSync(password, 10);
+  } else if (password && restaurant.password) {
+    // Le restaurant avait déjà un mot de passe, on garde l'existant
+    // Ne rien faire, on garde le mot de passe hashé lors de l'inscription
+  }
+  // Si pas de nouveau mot de passe et pas de mot de passe existant, on laisse null
   
   saveDB(db);
   
