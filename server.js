@@ -802,7 +802,9 @@ app.get('/api/settings', (req, res) => {
   if (!db.settings) {
     db.settings = {
       email: 'contact@uco-and-co.com',
-      brevoApiKey: ''
+      brevoApiKey: '',
+      adminTel: {countryCode: 'FR', number: ''},
+      smsEnabled: false
     };
     saveDB(db);
   }
@@ -811,19 +813,23 @@ app.get('/api/settings', (req, res) => {
   res.json({
     email: db.settings.email,
     brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
-    hasBrevoKey: !!db.settings.brevoApiKey
+    hasBrevoKey: !!db.settings.brevoApiKey,
+    adminTel: db.settings.adminTel || {countryCode: 'FR', number: ''},
+    smsEnabled: db.settings.smsEnabled || false
   });
 });
 
 // Mettre à jour les paramètres
 app.post('/api/settings', (req, res) => {
-  const { email, brevoApiKey } = req.body;
+  const { email, brevoApiKey, adminTel, smsEnabled } = req.body;
   
   if (!db.settings) {
     db.settings = {};
   }
   
   if (email !== undefined) db.settings.email = email;
+  if (adminTel !== undefined) db.settings.adminTel = adminTel;
+  if (smsEnabled !== undefined) db.settings.smsEnabled = smsEnabled;
   // Ne mettre à jour la clé que si elle n'est pas masquée
   if (brevoApiKey !== undefined && !brevoApiKey.startsWith('••••')) {
     db.settings.brevoApiKey = brevoApiKey;
@@ -836,7 +842,9 @@ app.post('/api/settings', (req, res) => {
     settings: {
       email: db.settings.email,
       brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
-      hasBrevoKey: !!db.settings.brevoApiKey
+      hasBrevoKey: !!db.settings.brevoApiKey,
+      adminTel: db.settings.adminTel || {countryCode: 'FR', number: ''},
+      smsEnabled: db.settings.smsEnabled || false
     }
   });
 });
@@ -891,6 +899,63 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // =============================================
+// ROUTES - ENVOI DE SMS (Sécurisé côté serveur via Brevo)
+// =============================================
+
+// Envoyer un SMS via l'API Brevo Transactional SMS
+app.post('/api/send-sms', async (req, res) => {
+  const { to, content } = req.body;
+  
+  if (!to || !content) {
+    return res.json({ success: false, error: 'Paramètres manquants (to, content)' });
+  }
+  
+  // Vérifier si les SMS sont activés
+  if (!db.settings?.smsEnabled) {
+    console.log('SMS désactivé, envoi ignoré');
+    return res.json({ success: false, error: 'SMS désactivé dans les paramètres' });
+  }
+  
+  const apiKey = db.settings?.brevoApiKey;
+  
+  if (!apiKey) {
+    console.warn('Clé API Brevo non configurée (SMS)');
+    return res.json({ success: false, error: 'Clé API Brevo non configurée' });
+  }
+  
+  try {
+    const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        type: 'transactional',
+        unicodeEnabled: false,
+        sender: 'UCOANDCO',
+        recipient: to,
+        content: content
+      })
+    });
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log('SMS envoyé avec succès à', to, '- messageId:', result.messageId);
+      res.json({ success: true, messageId: result.messageId });
+    } else {
+      const error = await response.json();
+      console.error('Erreur envoi SMS Brevo:', error);
+      res.json({ success: false, error: error.message || 'Erreur Brevo SMS' });
+    }
+  } catch (error) {
+    console.error('Erreur envoi SMS:', error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// =============================================
 // DÉMARRAGE DU SERVEUR
 // =============================================
 
@@ -898,3 +963,4 @@ app.listen(PORT, () => {
   console.log(`🚀 UCO Backend running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
 });
+
