@@ -855,10 +855,13 @@ app.post('/api/settings', (req, res) => {
 
 // Envoyer un email via Brevo (la clé API reste côté serveur)
 app.post('/api/send-email', async (req, res) => {
-  const { to, subject, htmlContent, senderName = 'UCO AND CO' } = req.body;
+  const { to, subject, htmlContent, html, senderName = 'UCO AND CO', attachment } = req.body;
   
-  if (!to || !subject || !htmlContent) {
-    return res.json({ success: false, error: 'Paramètres manquants (to, subject, htmlContent)' });
+  // Accepter html ou htmlContent
+  const emailHtml = htmlContent || html;
+  
+  if (!to || !subject || !emailHtml) {
+    return res.json({ success: false, error: 'Paramètres manquants (to, subject, htmlContent ou html)' });
   }
   
   const apiKey = db.settings?.brevoApiKey;
@@ -869,6 +872,21 @@ app.post('/api/send-email', async (req, res) => {
   }
   
   try {
+    const emailPayload = {
+      sender: { name: senderName, email: 'contact@uco-and-co.fr' },
+      to: [{ email: to }],
+      subject: subject,
+      htmlContent: emailHtml
+    };
+    
+    // Ajouter la pièce jointe si présente
+    if (attachment && attachment.content && attachment.name) {
+      emailPayload.attachment = [{
+        content: attachment.content,
+        name: attachment.name
+      }];
+    }
+    
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
       headers: {
@@ -876,16 +894,11 @@ app.post('/api/send-email', async (req, res) => {
         'api-key': apiKey,
         'content-type': 'application/json'
       },
-      body: JSON.stringify({
-        sender: { name: senderName, email: 'contact@uco-and-co.fr' },
-        to: [{ email: to }],
-        subject: subject,
-        htmlContent: htmlContent
-      })
+      body: JSON.stringify(emailPayload)
     });
     
     if (response.ok) {
-      console.log('Email envoyé avec succès à', to);
+      console.log('Email envoyé avec succès à', to, attachment ? '(avec pièce jointe)' : '');
       res.json({ success: true });
     } else {
       const error = await response.json();
@@ -963,4 +976,3 @@ app.listen(PORT, () => {
   console.log(`🚀 UCO Backend running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
 });
-
