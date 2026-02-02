@@ -488,10 +488,10 @@ app.get('/api/restaurants/pending', (req, res) => {
 
 // Liste des restaurants approuvés
 app.get('/api/restaurants', (req, res) => {
-  const approved = db.restaurants
-    .filter(r => r.status === 'approved')
+  const restaurants = db.restaurants
+    .filter(r => r.status === 'approved' || r.status === 'terminated')
     .map(({ password, ...r }) => r);
-  res.json(approved);
+  res.json(restaurants);
 });
 
 // Rechercher un restaurant par QR code
@@ -557,16 +557,23 @@ app.post('/api/restaurants/:id/reject', (req, res) => {
 // Ajouter un restaurant (admin)
 app.post('/api/restaurants', (req, res) => {
   const restaurant = {
-    id: uuidv4(),
     ...req.body,
-    status: 'approved',
-    dateCreated: new Date().toISOString()
+    id: req.body.id || req.body.qrCode || uuidv4(),
+    qrCode: req.body.qrCode || req.body.id || '',
+    status: req.body.status || 'approved',
+    dateCreated: req.body.dateCreated || new Date().toISOString()
   };
+  
+  // Vérifier si l'ID ou QR code existe déjà
+  const existing = db.restaurants.find(r => r.id === restaurant.id || r.qrCode === restaurant.qrCode);
+  if (existing) {
+    return res.json({ success: false, error: `QR Code "${restaurant.qrCode}" déjà attribué` });
+  }
   
   db.restaurants.push(restaurant);
   saveDB(db);
   
-  res.json({ success: true, id: restaurant.id });
+  res.json({ success: true, id: restaurant.id, qrCode: restaurant.qrCode });
 });
 
 // Modifier un restaurant
