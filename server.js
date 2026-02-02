@@ -457,17 +457,26 @@ app.put('/api/operators/:id/password', (req, res) => {
 
 // Inscription restaurant
 app.post('/api/restaurants/register', (req, res) => {
-  const { email, password, ...data } = req.body;
+  const { email, password, id, qrCode, ...data } = req.body;
   
-  if (db.restaurants.find(r => r.email === email)) {
+  // Vérifier si l'email existe déjà (seulement si email non vide)
+  if (email && db.restaurants.find(r => r.email === email)) {
     return res.json({ success: false, error: 'Email déjà utilisé' });
   }
   
+  // Vérifier si l'ID ou QR code existe déjà
+  const existingId = id && db.restaurants.find(r => r.id === id);
+  const existingQR = qrCode && db.restaurants.find(r => r.qrCode === qrCode);
+  if (existingId || existingQR) {
+    return res.json({ success: false, error: 'Ce restaurant ou QR Code existe déjà' });
+  }
+  
   const restaurant = {
-    id: uuidv4(),
-    email,
-    password: password ? bcrypt.hashSync(password, 10) : null, // Hasher le mot de passe
     ...data,
+    id: id || qrCode || uuidv4(),
+    qrCode: qrCode || id || '',
+    email: email || '',
+    password: password ? bcrypt.hashSync(password, 10) : null,
     status: 'pending',
     dateRequest: new Date().toISOString()
   };
@@ -475,7 +484,7 @@ app.post('/api/restaurants/register', (req, res) => {
   db.restaurants.push(restaurant);
   saveDB(db);
   
-  res.json({ success: true, id: restaurant.id });
+  res.json({ success: true, id: restaurant.id, qrCode: restaurant.qrCode });
 });
 
 // Liste des restaurants en attente
