@@ -1068,13 +1068,48 @@ app.delete('/api/operators/:email', async (req, res) => {
 // ===== RESTAURANTS =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
-    const { email, password, id, qrCode, ...data } = sanitizeObject(req.body);
+    const { email, password, id, qrCode, siret, ...data } = sanitizeObject(req.body);
     
+    // Si un SIRET est fourni, vérifier s'il existe déjà
+    let existingBySiret = null;
+    if (siret) {
+      existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
+    }
+    
+    // Vérifier l'email seulement si ce n'est PAS une réinscription du même SIRET
     if (email) {
-      const existing = await getRestaurantByEmail(email);
-      if (existing) {
-        return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
+      const existingByEmail = await getRestaurantByEmail(email);
+      if (existingByEmail) {
+        // Si l'email existe mais pour un SIRET différent → erreur
+        if (!existingBySiret || existingByEmail.siret !== siret) {
+          return res.status(409).json({ success: false, error: 'Email déjà utilisé par un autre restaurant' });
+        }
+        // Si c'est le même SIRET → c'est une réinscription, on permet
       }
+    }
+    
+    // Si le SIRET existe déjà, on met à jour au lieu de créer
+    if (existingBySiret) {
+      // Réinscription : mettre à jour le restaurant existant
+      const updateData = {
+        ...data,
+        email: email || existingBySiret.email,
+        password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : existingBySiret.password,
+        status: 'pending',
+        dateRequest: new Date().toISOString(),
+        isResubmission: true // Marquer comme réinscription
+      };
+      
+      await updateRestaurant(existingBySiret.id, updateData);
+      await auditLog('RESTAURANT_RESUBMIT', email || existingBySiret.id, { status: 'pending', siret }, req);
+      
+      return res.status(200).json({ 
+        success: true, 
+        id: existingBySiret.id, 
+        qrCode: existingBySiret.qrCode || existingBySiret.id,
+        isResubmission: true,
+        message: 'Demande de réinscription soumise'
+      });
     }
     
     const restaurantId = id || qrCode || uuidv4();
@@ -1091,6 +1126,7 @@ app.post('/api/restaurants/register', async (req, res) => {
       qrCode: qrCode || restaurantId,
       email: email || '',
       password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null,
+      siret: siret || '',
       ...data,
       status: 'pending',
       dateRequest: new Date().toISOString()
