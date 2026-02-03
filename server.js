@@ -401,9 +401,30 @@ async function getSettings() {
 
 async function updateSettings(newSettings) {
   if (!db) return false;
+  
+  // Récupérer les settings existants pour les préserver
+  const existingSettings = await getSettings();
+  
+  // Merger les nouveaux settings avec les existants (préserver admin et autres champs)
+  const mergedSettings = {
+    ...existingSettings,
+    ...newSettings,
+    // Préserver les sous-objets importants
+    admin: existingSettings.admin, // Ne jamais écraser admin via cette fonction
+    reviewLinks: {
+      ...(existingSettings.reviewLinks || {}),
+      ...(newSettings.reviewLinks || {})
+    }
+  };
+  
+  // Si brevoApiKey n'est pas fourni, garder l'ancien
+  if (!newSettings.brevoApiKey && existingSettings.brevoApiKey) {
+    mergedSettings.brevoApiKey = existingSettings.brevoApiKey;
+  }
+  
   await db.collection(COLLECTIONS.SETTINGS).updateOne(
     { _id: 'main' },
-    { $set: sanitizeObject(newSettings) },
+    { $set: mergedSettings },
     { upsert: true }
   );
   cache.settings = null;
@@ -1265,10 +1286,20 @@ app.get('/api/settings', async (req, res) => {
 
 app.put('/api/settings', async (req, res) => {
   try {
-    await updateSettings(sanitizeObject(req.body));
-    await auditLog('SETTINGS_UPDATED', 'admin', {}, req);
+    // Ne pas sanitizer brevoApiKey car elle peut contenir des caractères spéciaux
+    const { brevoApiKey, ...otherSettings } = req.body;
+    const sanitizedSettings = sanitizeObject(otherSettings);
+    
+    // Ajouter brevoApiKey sans sanitization si elle existe
+    if (brevoApiKey) {
+      sanitizedSettings.brevoApiKey = brevoApiKey;
+    }
+    
+    await updateSettings(sanitizedSettings);
+    await auditLog('SETTINGS_UPDATED', 'admin', { fields: Object.keys(req.body) }, req);
     res.json({ success: true });
   } catch (error) {
+    console.error('Erreur sauvegarde settings:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
