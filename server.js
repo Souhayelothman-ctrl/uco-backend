@@ -1127,6 +1127,60 @@ app.get('/api/restaurants/qr/:qrCode', async (req, res) => {
   res.json(data);
 });
 
+// Recherche par SIRET (retourne même les restaurants résiliés pour conserver le QR Code)
+app.get('/api/restaurants/siret/:siret', async (req, res) => {
+  const siret = req.params.siret.replace(/\D/g, '');
+  
+  if (siret.length !== 14) {
+    return res.status(400).json({ error: 'SIRET invalide (14 chiffres requis)' });
+  }
+  
+  if (!db) {
+    return res.status(503).json({ error: 'Base de données non disponible' });
+  }
+  
+  const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
+  
+  if (!restaurant) {
+    return res.status(404).json({ error: 'Restaurant non trouvé', exists: false });
+  }
+  
+  const { password, loginAttempts, lockUntil, ...data } = restaurant;
+  res.json({ ...data, exists: true });
+});
+
+// Fin de contrat restaurant
+app.post('/api/restaurants/:id/terminate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+    
+    const restaurant = await getRestaurantById(id);
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const dateTerminated = new Date().toISOString();
+    
+    await updateRestaurant(id, {
+      status: 'terminated',
+      dateTerminated,
+      terminationReason: reason || 'Fin de contrat'
+    });
+    
+    await auditLog('RESTAURANT_TERMINATED', id, { reason, dateTerminated }, req);
+    
+    res.json({ 
+      success: true, 
+      dateTerminated,
+      message: 'Contrat résilié avec succès'
+    });
+  } catch (error) {
+    console.error('Erreur fin de contrat:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 app.post('/api/restaurants/:id/approve', async (req, res) => {
   try {
     const { id } = req.params;
