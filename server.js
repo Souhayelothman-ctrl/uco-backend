@@ -70,15 +70,19 @@ app.use(cors({
 // 3. Rate Limiting - Protection contre les attaques par force brute
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requêtes par IP
+  max: 500, // 500 requêtes par IP par 15 minutes (augmenté)
   message: { success: false, error: 'Trop de requêtes, réessayez dans 15 minutes' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Ne pas limiter les requêtes de santé et les GET settings
+    return req.path === '/api/health' || (req.path === '/api/settings' && req.method === 'GET');
+  }
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 tentatives de connexion
+  max: 20, // 20 tentatives de connexion (augmenté)
   message: { success: false, error: 'Trop de tentatives de connexion, réessayez dans 15 minutes' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -86,7 +90,7 @@ const authLimiter = rateLimit({
 
 const strictLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 heure
-  max: 5, // 5 requêtes par heure (pour reset password, etc.)
+  max: 10, // 10 requêtes par heure pour reset password (augmenté)
   message: { success: false, error: 'Limite atteinte, réessayez plus tard' },
 });
 
@@ -1279,8 +1283,13 @@ app.put('/api/tournees/:id', async (req, res) => {
 // ===== SETTINGS =====
 app.get('/api/settings', async (req, res) => {
   const settings = await getSettings();
-  // Ne pas renvoyer les infos sensibles
-  const { admin, ...publicSettings } = settings;
+  // Ne pas renvoyer les infos sensibles (admin, clé Brevo complète)
+  const { admin, brevoApiKey, ...publicSettings } = settings;
+  
+  // Indiquer si la clé Brevo existe sans la révéler
+  publicSettings.brevoApiKey = brevoApiKey ? '••••••••••••••••' : '';
+  publicSettings.hasBrevoKey = !!brevoApiKey;
+  
   res.json(publicSettings);
 });
 
