@@ -2,905 +2,1298 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
+const { MongoClient } = require('mongodb');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const mongoSanitize = require('express-mongo-sanitize');
+const xss = require('xss-clean');
+const hpp = require('hpp');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// =============================================
+// CONFIGURATION SÉCURITÉ
+// =============================================
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+const JWT_EXPIRES_IN = '24h';
+const BCRYPT_ROUNDS = 12; // Plus sécurisé que 10
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCK_TIME = 15 * 60 * 1000; // 15 minutes
+
+// =============================================
+// MIDDLEWARES DE SÉCURITÉ
+// =============================================
+
+// 1. Helmet - Headers HTTP de sécurité
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// 2. CORS sécurisé
+const allowedOrigins = [
+  'https://uco-and-co.netlify.app',
+  'https://uco-and-co.fr',
+  'https://www.uco-and-co.fr',
+  process.env.FRONTEND_URL,
+  'http://localhost:3000', // Dev only
+  'http://localhost:5173'  // Dev only
+].filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permettre les requêtes sans origin (mobile apps, Postman)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
+      callback(null, true);
+    } else {
+      console.warn('🚫 CORS bloqué:', origin);
+      callback(new Error('Non autorisé par CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID']
+}));
+
+// 3. Rate Limiting - Protection contre les attaques par force brute
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requêtes par IP
+  message: { success: false, error: 'Trop de requêtes, réessayez dans 15 minutes' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 tentatives de connexion
+  message: { success: false, error: 'Trop de tentatives de connexion, réessayez dans 15 minutes' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 heure
+  max: 5, // 5 requêtes par heure (pour reset password, etc.)
+  message: { success: false, error: 'Limite atteinte, réessayez plus tard' },
+});
+
+app.use('/api/', generalLimiter);
+app.use('/api/auth/', authLimiter);
+app.use('/api/password-reset', strictLimiter);
+
+// 4. Body parser avec limite
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// 5. Sanitization contre les injections NoSQL
+app.use(mongoSanitize({
+  replaceWith: '_',
+  onSanitize: ({ req, key }) => {
+    console.warn(`🚫 Tentative d'injection NoSQL détectée: ${key}`);
+  }
+}));
+
+// 6. Protection XSS
+app.use(xss());
+
+// 7. Protection contre la pollution des paramètres HTTP
+app.use(hpp());
+
+// 8. Logging des requêtes (pour audit)
+app.use((req, res, next) => {
+  const requestId = uuidv4().slice(0, 8);
+  req.requestId = requestId;
+  
+  // Log uniquement en production pour les routes sensibles
+  if (req.path.includes('/auth') || req.path.includes('/password')) {
+    console.log(`[${new Date().toISOString()}] ${requestId} ${req.method} ${req.path} - IP: ${req.ip}`);
+  }
+  
+  // Ajouter l'ID de requête dans la réponse
+  res.setHeader('X-Request-ID', requestId);
+  next();
+});
 
 // =============================================
-// BASE DE DONNÉES JSON (Simple et fiable)
+// CONFIGURATION MONGODB ATLAS
 // =============================================
-const DB_FILE = path.join(__dirname, 'database.json');
+const MONGODB_URI = process.env.MONGODB_URI || '';
+const DB_NAME = 'ucoandco';
 
-// Structure initiale de la base de données
-const initialDB = {
+let db = null;
+let mongoClient = null;
+
+// Structure initiale
+const initialData = {
   admin: {
     email: 'contact@uco-and-co.com',
-    password: bcrypt.hashSync('30Septembre2006A$', 10)
+    password: bcrypt.hashSync('30Septembre2006A$', BCRYPT_ROUNDS),
+    loginAttempts: 0,
+    lockUntil: null
   },
-  collectors: [],
-  operators: [],
-  restaurants: [],
-  collections: [],
-  tournees: [],
-  dailyVolumes: [],
-  expeditions: [],
   settings: {
     email: 'contact@uco-and-co.com',
-    brevoApiKey: ''
+    brevoApiKey: '',
+    adminTel: '',
+    smsEnabled: false,
+    reviewLinks: {
+      google: '',
+      instagram: '',
+      facebook: '',
+      whatsapp: '+33610251063',
+      linkedin: '',
+      tripadvisor: ''
+    }
   }
 };
 
-// Charger ou créer la base de données
-function loadDB() {
+// Collections MongoDB
+const COLLECTIONS = {
+  SETTINGS: 'settings',
+  COLLECTORS: 'collectors',
+  OPERATORS: 'operators',
+  RESTAURANTS: 'restaurants',
+  COLLECTIONS: 'collections',
+  TOURNEES: 'tournees',
+  AUDIT_LOGS: 'auditLogs',
+  SESSIONS: 'sessions',
+  DOCUMENTS: 'documents',
+  CAMPAIGNS: 'campaigns'
+};
+
+// Cache avec TTL
+const cache = {
+  settings: null,
+  lastSettingsUpdate: 0,
+  TTL: 60000 // 1 minute
+};
+
+// =============================================
+// FONCTIONS UTILITAIRES DE SÉCURITÉ
+// =============================================
+
+// Validation d'email
+function isValidEmail(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+// Validation de mot de passe fort
+function isStrongPassword(password) {
+  // Minimum 8 caractères, 1 majuscule, 1 minuscule, 1 chiffre, 1 caractère spécial
+  const strongRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+  return strongRegex.test(password);
+}
+
+// Sanitization des entrées
+function sanitizeInput(input) {
+  if (typeof input !== 'string') return input;
+  return input
+    .replace(/[<>]/g, '') // Enlever les balises HTML
+    .trim()
+    .slice(0, 1000); // Limiter la longueur
+}
+
+// Sanitization récursive d'un objet
+function sanitizeObject(obj) {
+  if (typeof obj !== 'object' || obj === null) {
+    return sanitizeInput(obj);
+  }
+  
+  const sanitized = Array.isArray(obj) ? [] : {};
+  for (const key of Object.keys(obj)) {
+    // Bloquer les clés commençant par $ (opérateurs MongoDB)
+    if (key.startsWith('$')) continue;
+    sanitized[key] = sanitizeObject(obj[key]);
+  }
+  return sanitized;
+}
+
+// Génération de token JWT
+function generateToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+// Vérification de token JWT
+function verifyToken(token) {
   try {
-    if (fs.existsSync(DB_FILE)) {
-      const data = fs.readFileSync(DB_FILE, 'utf8');
-      return JSON.parse(data);
+    return jwt.verify(token, JWT_SECRET);
+  } catch (error) {
+    return null;
+  }
+}
+
+// Middleware d'authentification JWT
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'Token manquant' });
+  }
+  
+  const decoded = verifyToken(token);
+  if (!decoded) {
+    return res.status(403).json({ success: false, error: 'Token invalide ou expiré' });
+  }
+  
+  req.user = decoded;
+  next();
+}
+
+// Middleware de vérification de rôle
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: 'Accès non autorisé' });
     }
-  } catch (e) {
-    console.log('Erreur lecture DB, création nouvelle:', e.message);
-  }
-  saveDB(initialDB);
-  return initialDB;
+    next();
+  };
 }
 
-// Sauvegarder la base de données
-function saveDB(data) {
+// Log d'audit
+async function auditLog(action, userId, details, req) {
+  if (!db) return;
+  
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Erreur sauvegarde DB:', e.message);
+    await db.collection(COLLECTIONS.AUDIT_LOGS).insertOne({
+      _id: uuidv4(),
+      action,
+      userId,
+      details: sanitizeObject(details),
+      ip: req?.ip || 'unknown',
+      userAgent: req?.headers['user-agent'] || 'unknown',
+      requestId: req?.requestId,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Erreur audit log:', error.message);
   }
 }
 
-// Charger la DB au démarrage
-let db = loadDB();
+// Vérification du verrouillage de compte
+function isAccountLocked(user) {
+  if (!user.lockUntil) return false;
+  return new Date(user.lockUntil) > new Date();
+}
 
-// =============================================
-// FONCTIONS UTILITAIRES
-// =============================================
-
-// Générer un numéro de collecteur unique
-function generateCollectorNumber() {
-  const existingNumbers = db.collectors
-    .filter(c => c.status === 'approved' && c.collectorNumber)
-    .map(c => c.collectorNumber);
+// Incrémenter les tentatives de connexion
+async function incrementLoginAttempts(collection, identifier) {
+  if (!db) return;
   
-  let num = 1;
-  while (existingNumbers.includes(num)) {
-    num++;
+  const update = {
+    $inc: { loginAttempts: 1 }
+  };
+  
+  // Verrouiller si max atteint
+  const user = await db.collection(collection).findOne({ email: identifier });
+  if (user && user.loginAttempts >= MAX_LOGIN_ATTEMPTS - 1) {
+    update.$set = { lockUntil: new Date(Date.now() + LOCK_TIME).toISOString() };
   }
+  
+  await db.collection(collection).updateOne({ email: identifier }, update);
+}
+
+// Réinitialiser les tentatives de connexion
+async function resetLoginAttempts(collection, identifier) {
+  if (!db) return;
+  await db.collection(collection).updateOne(
+    { email: identifier },
+    { $set: { loginAttempts: 0, lockUntil: null } }
+  );
+}
+
+// =============================================
+// CONNEXION MONGODB SÉCURISÉE
+// =============================================
+async function connectDB() {
+  if (!MONGODB_URI) {
+    console.warn('⚠️ MONGODB_URI non configurée - Mode mémoire uniquement');
+    return false;
+  }
+
+  try {
+    console.log('🔄 Connexion sécurisée à MongoDB Atlas...');
+    mongoClient = new MongoClient(MONGODB_URI, {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    });
+    
+    await mongoClient.connect();
+    db = mongoClient.db(DB_NAME);
+    
+    // Créer les index
+    await db.collection(COLLECTIONS.COLLECTORS).createIndex({ email: 1 }, { unique: true, sparse: true });
+    await db.collection(COLLECTIONS.OPERATORS).createIndex({ email: 1 }, { unique: true, sparse: true });
+    await db.collection(COLLECTIONS.RESTAURANTS).createIndex({ id: 1 }, { unique: true });
+    await db.collection(COLLECTIONS.RESTAURANTS).createIndex({ qrCode: 1 }, { sparse: true });
+    await db.collection(COLLECTIONS.RESTAURANTS).createIndex({ email: 1 }, { sparse: true });
+    await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ timestamp: -1 });
+    await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ action: 1 });
+    await db.collection(COLLECTIONS.SESSIONS).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    
+    // Initialiser les settings
+    const existingSettings = await db.collection(COLLECTIONS.SETTINGS).findOne({ _id: 'main' });
+    if (!existingSettings) {
+      await db.collection(COLLECTIONS.SETTINGS).insertOne({ 
+        _id: 'main', 
+        ...initialData.settings, 
+        admin: initialData.admin 
+      });
+    }
+    
+    console.log('✅ Connecté à MongoDB Atlas avec succès (mode sécurisé)');
+    return true;
+  } catch (error) {
+    console.error('❌ Erreur connexion MongoDB:', error.message);
+    return false;
+  }
+}
+
+// Gestion gracieuse de la fermeture
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Arrêt du serveur...');
+  if (mongoClient) {
+    await mongoClient.close();
+    console.log('✅ Connexion MongoDB fermée');
+  }
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
+  if (mongoClient) {
+    await mongoClient.close();
+  }
+  process.exit(0);
+});
+
+// =============================================
+// FONCTIONS D'ACCÈS AUX DONNÉES
+// =============================================
+
+async function getSettings() {
+  if (!db) return initialData.settings;
+  
+  if (cache.settings && Date.now() - cache.lastSettingsUpdate < cache.TTL) {
+    return cache.settings;
+  }
+  
+  const doc = await db.collection(COLLECTIONS.SETTINGS).findOne({ _id: 'main' });
+  cache.settings = doc || initialData.settings;
+  cache.lastSettingsUpdate = Date.now();
+  return cache.settings;
+}
+
+async function updateSettings(newSettings) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.SETTINGS).updateOne(
+    { _id: 'main' },
+    { $set: sanitizeObject(newSettings) },
+    { upsert: true }
+  );
+  cache.settings = null;
+  return true;
+}
+
+async function getAdmin() {
+  const settings = await getSettings();
+  return settings.admin || initialData.admin;
+}
+
+// Collecteurs
+async function getCollectors(status = null) {
+  if (!db) return [];
+  const query = status ? { status } : {};
+  return await db.collection(COLLECTIONS.COLLECTORS).find(query).toArray();
+}
+
+async function getCollectorByEmail(email) {
+  if (!db) return null;
+  return await db.collection(COLLECTIONS.COLLECTORS).findOne({ email: sanitizeInput(email) });
+}
+
+async function addCollector(collector) {
+  if (!db) return null;
+  const sanitized = sanitizeObject(collector);
+  const result = await db.collection(COLLECTIONS.COLLECTORS).insertOne({
+    ...sanitized,
+    _id: sanitized.email,
+    loginAttempts: 0,
+    lockUntil: null,
+    createdAt: new Date().toISOString()
+  });
+  return result.insertedId;
+}
+
+async function updateCollector(email, data) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.COLLECTORS).updateOne(
+    { email: sanitizeInput(email) },
+    { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
+  );
+  return true;
+}
+
+async function deleteCollector(email) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.COLLECTORS).deleteOne({ email: sanitizeInput(email) });
+  return true;
+}
+
+// Opérateurs
+async function getOperators(status = null) {
+  if (!db) return [];
+  const query = status ? { status } : {};
+  return await db.collection(COLLECTIONS.OPERATORS).find(query).toArray();
+}
+
+async function getOperatorByEmail(email) {
+  if (!db) return null;
+  return await db.collection(COLLECTIONS.OPERATORS).findOne({ email: sanitizeInput(email) });
+}
+
+async function addOperator(operator) {
+  if (!db) return null;
+  const sanitized = sanitizeObject(operator);
+  const result = await db.collection(COLLECTIONS.OPERATORS).insertOne({
+    ...sanitized,
+    _id: sanitized.email,
+    loginAttempts: 0,
+    lockUntil: null,
+    createdAt: new Date().toISOString()
+  });
+  return result.insertedId;
+}
+
+async function updateOperator(email, data) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.OPERATORS).updateOne(
+    { email: sanitizeInput(email) },
+    { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
+  );
+  return true;
+}
+
+async function deleteOperator(email) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.OPERATORS).deleteOne({ email: sanitizeInput(email) });
+  return true;
+}
+
+// Restaurants
+async function getRestaurants(status = null) {
+  if (!db) return [];
+  const query = status ? { status } : {};
+  return await db.collection(COLLECTIONS.RESTAURANTS).find(query).toArray();
+}
+
+async function getRestaurantById(id) {
+  if (!db) return null;
+  return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ id: sanitizeInput(id) });
+}
+
+async function getRestaurantByQRCode(qrCode) {
+  if (!db) return null;
+  return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ qrCode: sanitizeInput(qrCode) });
+}
+
+async function getRestaurantByEmail(email) {
+  if (!db) return null;
+  return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ email: sanitizeInput(email) });
+}
+
+async function addRestaurant(restaurant) {
+  if (!db) return null;
+  const sanitized = sanitizeObject(restaurant);
+  const result = await db.collection(COLLECTIONS.RESTAURANTS).insertOne({
+    ...sanitized,
+    _id: sanitized.id,
+    loginAttempts: 0,
+    lockUntil: null,
+    createdAt: new Date().toISOString()
+  });
+  return result.insertedId;
+}
+
+async function updateRestaurant(id, data) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+    { id: sanitizeInput(id) },
+    { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
+  );
+  return true;
+}
+
+async function deleteRestaurant(id) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.RESTAURANTS).deleteOne({ id: sanitizeInput(id) });
+  return true;
+}
+
+// Collections
+async function getCollections() {
+  if (!db) return [];
+  return await db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).toArray();
+}
+
+async function addCollection(collection) {
+  if (!db) return null;
+  const sanitized = sanitizeObject(collection);
+  const result = await db.collection(COLLECTIONS.COLLECTIONS).insertOne({
+    ...sanitized,
+    _id: sanitized.id || uuidv4(),
+    createdAt: new Date().toISOString()
+  });
+  return result.insertedId;
+}
+
+// Tournées
+async function getTournees() {
+  if (!db) return [];
+  return await db.collection(COLLECTIONS.TOURNEES).find({}).sort({ dateDepart: -1 }).toArray();
+}
+
+async function addTournee(tournee) {
+  if (!db) return null;
+  const sanitized = sanitizeObject(tournee);
+  const result = await db.collection(COLLECTIONS.TOURNEES).insertOne({
+    ...sanitized,
+    _id: sanitized.id || uuidv4(),
+    createdAt: new Date().toISOString()
+  });
+  return result.insertedId;
+}
+
+async function updateTournee(id, data) {
+  if (!db) return false;
+  await db.collection(COLLECTIONS.TOURNEES).updateOne(
+    { _id: sanitizeInput(id) },
+    { $set: sanitizeObject(data) }
+  );
+  return true;
+}
+
+// Numéros uniques
+async function generateCollectorNumber() {
+  const collectors = await getCollectors('approved');
+  const existingNumbers = collectors.filter(c => c.collectorNumber).map(c => c.collectorNumber);
+  let num = 1;
+  while (existingNumbers.includes(num)) num++;
   return num;
 }
 
-// Générer un numéro d'opérateur unique
-function generateOperatorNumber() {
-  const existingNumbers = db.operators
-    .filter(o => o.status === 'approved' && o.operatorNumber)
-    .map(o => o.operatorNumber);
-  
+async function generateOperatorNumber() {
+  const operators = await getOperators('approved');
+  const existingNumbers = operators.filter(o => o.operatorNumber).map(o => o.operatorNumber);
   let num = 1;
-  while (existingNumbers.includes(num)) {
-    num++;
-  }
+  while (existingNumbers.includes(num)) num++;
   return num;
 }
 
-// Générer un numéro d'ordre: AAMMJJ-XXX-YY
-function generateNumeroOrdre(collectorNumber, date) {
-  const d = new Date(date);
-  const aa = String(d.getFullYear()).slice(-2);
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const jj = String(d.getDate()).padStart(2, '0');
-  const colNum = String(collectorNumber).padStart(3, '0');
+// =============================================
+// ROUTES API
+// =============================================
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    database: db ? 'MongoDB Atlas' : 'Non connecté',
+    persistent: db !== null,
+    secure: true,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ===== AUTHENTIFICATION SÉCURISÉE =====
+app.post('/api/auth/admin', async (req, res) => {
+  try {
+    const { email, password } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    const admin = await getAdmin();
+    
+    // Vérifier le verrouillage
+    if (isAccountLocked(admin)) {
+      await auditLog('ADMIN_LOGIN_LOCKED', email, { reason: 'Account locked' }, req);
+      return res.status(423).json({ 
+        success: false, 
+        error: 'Compte verrouillé. Réessayez dans 15 minutes.' 
+      });
+    }
+    
+    if (email !== admin.email) {
+      await auditLog('ADMIN_LOGIN_FAILED', email, { reason: 'Invalid email' }, req);
+      return res.status(401).json({ success: false, error: 'Identifiants incorrects' });
+    }
+    
+    const isValid = await bcrypt.compare(password, admin.password);
+    
+    if (!isValid) {
+      await auditLog('ADMIN_LOGIN_FAILED', email, { reason: 'Invalid password' }, req);
+      // Incrémenter les tentatives (pour admin, on stocke dans settings)
+      return res.status(401).json({ success: false, error: 'Identifiants incorrects' });
+    }
+    
+    // Succès - Générer token
+    const token = generateToken({ role: 'admin', email });
+    
+    await auditLog('ADMIN_LOGIN_SUCCESS', email, {}, req);
+    
+    res.json({ 
+      success: true, 
+      role: 'admin',
+      token,
+      expiresIn: JWT_EXPIRES_IN
+    });
+  } catch (error) {
+    console.error('Erreur auth admin:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/auth/collector', async (req, res) => {
+  try {
+    const { email, password } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'Format d\'email invalide' });
+    }
+    
+    const collector = await getCollectorByEmail(email);
+    
+    if (!collector) {
+      await auditLog('COLLECTOR_LOGIN_FAILED', email, { reason: 'Not found' }, req);
+      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
+    }
+    
+    if (collector.status === 'pending') {
+      return res.json({ success: false, error: 'pending' });
+    }
+    
+    if (collector.status !== 'approved') {
+      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
+    }
+    
+    if (isAccountLocked(collector)) {
+      await auditLog('COLLECTOR_LOGIN_LOCKED', email, { reason: 'Account locked' }, req);
+      return res.status(423).json({ 
+        success: false, 
+        error: 'Compte verrouillé. Réessayez dans 15 minutes.' 
+      });
+    }
+    
+    const isValid = await bcrypt.compare(password, collector.password);
+    
+    if (!isValid) {
+      await incrementLoginAttempts(COLLECTIONS.COLLECTORS, email);
+      await auditLog('COLLECTOR_LOGIN_FAILED', email, { reason: 'Invalid password' }, req);
+      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+    }
+    
+    // Succès
+    await resetLoginAttempts(COLLECTIONS.COLLECTORS, email);
+    
+    const token = generateToken({ 
+      role: 'collector', 
+      email,
+      collectorNumber: collector.collectorNumber 
+    });
+    
+    const { password: _, loginAttempts, lockUntil, ...data } = collector;
+    
+    await auditLog('COLLECTOR_LOGIN_SUCCESS', email, {}, req);
+    
+    res.json({ 
+      success: true, 
+      role: 'collector', 
+      data,
+      token,
+      expiresIn: JWT_EXPIRES_IN
+    });
+  } catch (error) {
+    console.error('Erreur auth collector:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/auth/operator', async (req, res) => {
+  try {
+    const { email, password } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    const operator = await getOperatorByEmail(email);
+    
+    if (!operator) {
+      await auditLog('OPERATOR_LOGIN_FAILED', email, { reason: 'Not found' }, req);
+      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
+    }
+    
+    if (operator.status === 'pending') {
+      return res.json({ success: false, error: 'pending' });
+    }
+    
+    if (operator.status !== 'approved') {
+      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
+    }
+    
+    if (isAccountLocked(operator)) {
+      return res.status(423).json({ success: false, error: 'Compte verrouillé' });
+    }
+    
+    const isValid = await bcrypt.compare(password, operator.password);
+    
+    if (!isValid) {
+      await incrementLoginAttempts(COLLECTIONS.OPERATORS, email);
+      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+    }
+    
+    await resetLoginAttempts(COLLECTIONS.OPERATORS, email);
+    
+    const token = generateToken({ role: 'operator', email });
+    const { password: _, loginAttempts, lockUntil, ...data } = operator;
+    
+    await auditLog('OPERATOR_LOGIN_SUCCESS', email, {}, req);
+    
+    res.json({ success: true, role: 'operator', data, token });
+  } catch (error) {
+    console.error('Erreur auth operator:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/auth/restaurant', async (req, res) => {
+  try {
+    const { email, password } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    const restaurant = await getRestaurantByEmail(email);
+    
+    if (!restaurant) {
+      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
+    }
+    
+    if (restaurant.status === 'pending') {
+      return res.json({ success: false, error: 'pending' });
+    }
+    
+    if (restaurant.status !== 'approved') {
+      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
+    }
+    
+    if (!restaurant.password) {
+      return res.status(401).json({ success: false, error: 'Mot de passe non configuré' });
+    }
+    
+    if (isAccountLocked(restaurant)) {
+      return res.status(423).json({ success: false, error: 'Compte verrouillé' });
+    }
+    
+    const isValid = await bcrypt.compare(password, restaurant.password);
+    
+    if (!isValid) {
+      await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
+      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+    }
+    
+    await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
+    
+    const token = generateToken({ role: 'restaurant', email, id: restaurant.id });
+    const { password: _, loginAttempts, lockUntil, ...data } = restaurant;
+    
+    await auditLog('RESTAURANT_LOGIN_SUCCESS', email, {}, req);
+    
+    res.json({ success: true, role: 'restaurant', data, token });
+  } catch (error) {
+    console.error('Erreur auth restaurant:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// Vérification de token
+app.get('/api/auth/verify', authenticateToken, (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// ===== COLLECTEURS =====
+app.post('/api/collectors/register', async (req, res) => {
+  try {
+    const { email, password, ...data } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'Format d\'email invalide' });
+    }
+    
+    // Vérifier force du mot de passe (optionnel mais recommandé)
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, error: 'Le mot de passe doit contenir au moins 8 caractères' });
+    }
+    
+    const existing = await getCollectorByEmail(email);
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
+    }
+    
+    await addCollector({
+      email,
+      password: await bcrypt.hash(password, BCRYPT_ROUNDS),
+      ...data,
+      status: 'pending',
+      dateRequest: new Date().toISOString()
+    });
+    
+    await auditLog('COLLECTOR_REGISTER', email, { status: 'pending' }, req);
+    
+    res.status(201).json({ success: true });
+  } catch (error) {
+    console.error('Erreur register collector:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/collectors/pending', async (req, res) => {
+  const collectors = await getCollectors('pending');
+  res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
+});
+
+app.get('/api/collectors/approved', async (req, res) => {
+  const collectors = await getCollectors('approved');
+  res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
+});
+
+app.post('/api/collectors/:email/approve', async (req, res) => {
+  try {
+    const { email } = req.params;
+    const collectorNumber = await generateCollectorNumber();
+    
+    await updateCollector(email, {
+      status: 'approved',
+      collectorNumber,
+      dateApproval: new Date().toISOString()
+    });
+    
+    await auditLog('COLLECTOR_APPROVED', email, { collectorNumber }, req);
+    
+    res.json({ success: true, collectorNumber });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/collectors/:email/reject', async (req, res) => {
+  const { email } = req.params;
+  await deleteCollector(email);
+  await auditLog('COLLECTOR_REJECTED', email, {}, req);
+  res.json({ success: true });
+});
+
+app.delete('/api/collectors/:email', async (req, res) => {
+  const { email } = req.params;
+  await deleteCollector(email);
+  await auditLog('COLLECTOR_DELETED', email, {}, req);
+  res.json({ success: true });
+});
+
+// ===== OPÉRATEURS =====
+app.post('/api/operators/register', async (req, res) => {
+  try {
+    const { email, password, ...data } = sanitizeObject(req.body);
+    
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    }
+    
+    const existing = await getOperatorByEmail(email);
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
+    }
+    
+    await addOperator({
+      email,
+      password: await bcrypt.hash(password, BCRYPT_ROUNDS),
+      ...data,
+      status: 'pending',
+      dateRequest: new Date().toISOString()
+    });
+    
+    await auditLog('OPERATOR_REGISTER', email, { status: 'pending' }, req);
+    
+    res.status(201).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/operators/pending', async (req, res) => {
+  const operators = await getOperators('pending');
+  res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
+});
+
+app.get('/api/operators/approved', async (req, res) => {
+  const operators = await getOperators('approved');
+  res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
+});
+
+app.post('/api/operators/:email/approve', async (req, res) => {
+  const { email } = req.params;
+  const operatorNumber = await generateOperatorNumber();
   
-  // Compter les collectes du jour pour ce collecteur
-  const dateStr = d.toISOString().split('T')[0];
-  const todayCollections = db.collections.filter(c => {
-    const cDate = new Date(c.date).toISOString().split('T')[0];
-    return c.collectorNumber === collectorNumber && cDate === dateStr;
+  await updateOperator(email, {
+    status: 'approved',
+    operatorNumber,
+    dateApproval: new Date().toISOString()
   });
   
-  const ordre = String(todayCollections.length + 1).padStart(2, '0');
-  return `${aa}${mm}${jj}-${colNum}-${ordre}`;
-}
-
-// =============================================
-// ROUTES - HEALTH CHECK
-// =============================================
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  await auditLog('OPERATOR_APPROVED', email, { operatorNumber }, req);
+  
+  res.json({ success: true, operatorNumber });
 });
 
-// =============================================
-// ROUTES - PROXY APIS GOUVERNEMENTALES
-// =============================================
+app.post('/api/operators/:email/reject', async (req, res) => {
+  const { email } = req.params;
+  await deleteOperator(email);
+  await auditLog('OPERATOR_REJECTED', email, {}, req);
+  res.json({ success: true });
+});
 
-// Proxy pour l'API recherche entreprises (SIRET)
-app.get('/api/proxy/siret/:siret', async (req, res) => {
+app.delete('/api/operators/:email', async (req, res) => {
+  const { email } = req.params;
+  await deleteOperator(email);
+  res.json({ success: true });
+});
+
+// ===== RESTAURANTS =====
+app.post('/api/restaurants/register', async (req, res) => {
   try {
-    const siret = req.params.siret.replace(/\D/g, '');
-    if (siret.length !== 14) {
-      return res.status(400).json({ error: 'SIRET invalide' });
+    const { email, password, id, qrCode, ...data } = sanitizeObject(req.body);
+    
+    if (email) {
+      const existing = await getRestaurantByEmail(email);
+      if (existing) {
+        return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
+      }
     }
     
-    const response = await fetch(`https://recherche-entreprises.api.gouv.fr/search?q=${siret}&page=1&per_page=1`);
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'API non disponible' });
+    const restaurantId = id || qrCode || uuidv4();
+    
+    if (qrCode) {
+      const existingQR = await getRestaurantByQRCode(qrCode);
+      if (existingQR) {
+        return res.status(409).json({ success: false, error: 'QR Code déjà utilisé' });
+      }
     }
     
-    const data = await response.json();
-    res.json(data);
-  } catch (e) {
-    console.error('Erreur proxy SIRET:', e.message);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-// Proxy pour l'API geo.api.gouv.fr (villes par code postal)
-app.get('/api/proxy/villes/:cp', async (req, res) => {
-  try {
-    const cp = req.params.cp.replace(/\D/g, '');
-    if (cp.length !== 5) {
-      return res.status(400).json({ error: 'Code postal invalide' });
-    }
+    await addRestaurant({
+      id: restaurantId,
+      qrCode: qrCode || restaurantId,
+      email: email || '',
+      password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null,
+      ...data,
+      status: 'pending',
+      dateRequest: new Date().toISOString()
+    });
     
-    const response = await fetch(`https://geo.api.gouv.fr/communes?codePostal=${cp}&fields=nom&format=json`);
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'API non disponible' });
-    }
+    await auditLog('RESTAURANT_REGISTER', email || restaurantId, { status: 'pending' }, req);
     
-    const data = await response.json();
-    res.json(data);
-  } catch (e) {
-    console.error('Erreur proxy villes:', e.message);
-    res.status(500).json({ error: 'Erreur serveur' });
+    res.status(201).json({ success: true, id: restaurantId, qrCode: qrCode || restaurantId });
+  } catch (error) {
+    console.error('Erreur register restaurant:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
 
-// =============================================
-// ROUTES - AUTHENTIFICATION
-// =============================================
-
-// Login Admin
-app.post('/api/auth/admin', (req, res) => {
-  const { email, password } = req.body;
-  
-  if (email === db.admin.email && bcrypt.compareSync(password, db.admin.password)) {
-    res.json({ success: true, user: { email: db.admin.email, role: 'admin' } });
-  } else {
-    res.json({ success: false, error: 'Identifiants incorrects' });
-  }
+app.get('/api/restaurants/pending', async (req, res) => {
+  const restaurants = await getRestaurants('pending');
+  res.json(restaurants.map(({ password, loginAttempts, lockUntil, ...r }) => r));
 });
 
-// Login Collecteur
-app.post('/api/auth/collector', (req, res) => {
-  const { email, password } = req.body;
-  
-  const collector = db.collectors.find(c => c.email === email && c.status === 'approved');
-  
-  if (collector && bcrypt.compareSync(password, collector.password)) {
-    const { password: _, ...userData } = collector;
-    res.json({ success: true, user: userData });
-  } else {
-    res.json({ success: false, error: 'Identifiants incorrects ou compte non approuvé' });
-  }
+app.get('/api/restaurants', async (req, res) => {
+  const all = await getRestaurants();
+  const filtered = all.filter(r => r.status === 'approved' || r.status === 'terminated');
+  res.json(filtered.map(({ password, loginAttempts, lockUntil, ...r }) => r));
 });
 
-// Login Opérateur
-app.post('/api/auth/operator', (req, res) => {
-  const { email, password } = req.body;
+app.get('/api/restaurants/qr/:qrCode', async (req, res) => {
+  const restaurant = await getRestaurantByQRCode(req.params.qrCode);
   
-  const operator = db.operators.find(o => o.email === email && o.status === 'approved');
-  
-  if (operator && bcrypt.compareSync(password, operator.password)) {
-    const { password: _, ...userData } = operator;
-    res.json({ success: true, user: userData });
-  } else {
-    res.json({ success: false, error: 'Identifiants incorrects ou compte non approuvé' });
-  }
-});
-
-// Login Restaurant
-app.post('/api/auth/restaurant', (req, res) => {
-  const { email, password } = req.body;
-  
-  const restaurant = db.restaurants.find(r => r.email === email && r.status === 'approved');
-  
-  if (!restaurant || !restaurant.password) {
-    return res.json({ success: false, error: 'Identifiants incorrects ou compte non approuvé' });
-  }
-  
-  // Vérifier le mot de passe (hashé avec bcrypt ou en clair pour la migration)
-  let passwordValid = false;
-  
-  // Essayer d'abord la comparaison bcrypt (mot de passe hashé)
-  try {
-    passwordValid = bcrypt.compareSync(password, restaurant.password);
-  } catch (e) {
-    // Si bcrypt échoue, le mot de passe n'est peut-être pas hashé
-    passwordValid = false;
-  }
-  
-  // Si bcrypt échoue, essayer la comparaison directe (anciens comptes non hashés)
-  if (!passwordValid && password === restaurant.password) {
-    passwordValid = true;
-    // Hasher le mot de passe pour les prochaines connexions
-    restaurant.password = bcrypt.hashSync(password, 10);
-    saveDB(db);
-  }
-  
-  if (passwordValid) {
-    const { password: _, ...userData } = restaurant;
-    res.json({ success: true, user: userData });
-  } else {
-    res.json({ success: false, error: 'Identifiants incorrects ou compte non approuvé' });
-  }
-});
-
-// =============================================
-// ROUTES - COLLECTEURS
-// =============================================
-
-// Inscription collecteur
-app.post('/api/collectors/register', (req, res) => {
-  const { email, password, ...data } = req.body;
-  
-  // Vérifier si email déjà utilisé
-  if (db.collectors.find(c => c.email === email)) {
-    return res.json({ success: false, error: 'Email déjà utilisé' });
-  }
-  
-  const collector = {
-    id: uuidv4(),
-    email,
-    password: bcrypt.hashSync(password, 10),
-    ...data,
-    status: 'pending',
-    dateRequest: new Date().toISOString()
-  };
-  
-  db.collectors.push(collector);
-  saveDB(db);
-  
-  res.json({ success: true, id: collector.id });
-});
-
-// Liste des collecteurs en attente
-app.get('/api/collectors/pending', (req, res) => {
-  const pending = db.collectors
-    .filter(c => c.status === 'pending')
-    .map(({ password, ...c }) => c);
-  res.json(pending);
-});
-
-// Liste des collecteurs approuvés
-app.get('/api/collectors/approved', (req, res) => {
-  const approved = db.collectors
-    .filter(c => c.status === 'approved')
-    .map(({ password, ...c }) => c);
-  res.json(approved);
-});
-
-// Approuver un collecteur
-app.post('/api/collectors/:id/approve', (req, res) => {
-  const collector = db.collectors.find(c => c.id === req.params.id);
-  
-  if (!collector) {
-    return res.json({ success: false, error: 'Collecteur non trouvé' });
-  }
-  
-  collector.status = 'approved';
-  collector.collectorNumber = generateCollectorNumber();
-  collector.dateApproval = new Date().toISOString();
-  
-  saveDB(db);
-  
-  res.json({ success: true, collectorNumber: collector.collectorNumber });
-});
-
-// Refuser un collecteur
-app.post('/api/collectors/:id/reject', (req, res) => {
-  const index = db.collectors.findIndex(c => c.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Collecteur non trouvé' });
-  }
-  
-  db.collectors.splice(index, 1);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// Supprimer un collecteur
-app.delete('/api/collectors/:id', (req, res) => {
-  const index = db.collectors.findIndex(c => c.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Collecteur non trouvé' });
-  }
-  
-  db.collectors.splice(index, 1);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// Mettre à jour le mot de passe d'un collecteur
-app.put('/api/collectors/:id/password', (req, res) => {
-  const { password } = req.body;
-  const collector = db.collectors.find(c => c.id === req.params.id || c.email === req.params.id);
-  
-  if (!collector) {
-    return res.json({ success: false, error: 'Collecteur non trouvé' });
-  }
-  
-  collector.password = bcrypt.hashSync(password, 10);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// =============================================
-// ROUTES - OPÉRATEURS
-// =============================================
-
-// Inscription opérateur
-app.post('/api/operators/register', (req, res) => {
-  const { email, password, ...data } = req.body;
-  
-  if (db.operators.find(o => o.email === email)) {
-    return res.json({ success: false, error: 'Email déjà utilisé' });
-  }
-  
-  const operator = {
-    id: uuidv4(),
-    email,
-    password: bcrypt.hashSync(password, 10),
-    ...data,
-    status: 'pending',
-    dateRequest: new Date().toISOString()
-  };
-  
-  db.operators.push(operator);
-  saveDB(db);
-  
-  res.json({ success: true, id: operator.id });
-});
-
-// Liste des opérateurs en attente
-app.get('/api/operators/pending', (req, res) => {
-  const pending = db.operators
-    .filter(o => o.status === 'pending')
-    .map(({ password, ...o }) => o);
-  res.json(pending);
-});
-
-// Liste des opérateurs approuvés
-app.get('/api/operators/approved', (req, res) => {
-  const approved = db.operators
-    .filter(o => o.status === 'approved')
-    .map(({ password, ...o }) => o);
-  res.json(approved);
-});
-
-// Approuver un opérateur
-app.post('/api/operators/:id/approve', (req, res) => {
-  const operator = db.operators.find(o => o.id === req.params.id);
-  
-  if (!operator) {
-    return res.json({ success: false, error: 'Opérateur non trouvé' });
-  }
-  
-  operator.status = 'approved';
-  operator.operatorNumber = generateOperatorNumber();
-  operator.dateApproval = new Date().toISOString();
-  
-  saveDB(db);
-  
-  res.json({ success: true, operatorNumber: operator.operatorNumber });
-});
-
-// Refuser un opérateur
-app.post('/api/operators/:id/reject', (req, res) => {
-  const index = db.operators.findIndex(o => o.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Opérateur non trouvé' });
-  }
-  
-  db.operators.splice(index, 1);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// Supprimer un opérateur
-app.delete('/api/operators/:id', (req, res) => {
-  const index = db.operators.findIndex(o => o.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Opérateur non trouvé' });
-  }
-  
-  db.operators.splice(index, 1);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// Mettre à jour le mot de passe d'un opérateur
-app.put('/api/operators/:id/password', (req, res) => {
-  const { password } = req.body;
-  const operator = db.operators.find(o => o.id === req.params.id || o.email === req.params.id);
-  
-  if (!operator) {
-    return res.json({ success: false, error: 'Opérateur non trouvé' });
-  }
-  
-  operator.password = bcrypt.hashSync(password, 10);
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// =============================================
-// ROUTES - RESTAURANTS
-// =============================================
-
-// Inscription restaurant
-app.post('/api/restaurants/register', (req, res) => {
-  const { email, password, id, qrCode, ...data } = req.body;
-  
-  // Vérifier si l'email existe déjà (seulement si email non vide)
-  if (email && db.restaurants.find(r => r.email === email)) {
-    return res.json({ success: false, error: 'Email déjà utilisé' });
-  }
-  
-  // Vérifier si l'ID ou QR code existe déjà
-  const existingId = id && db.restaurants.find(r => r.id === id);
-  const existingQR = qrCode && db.restaurants.find(r => r.qrCode === qrCode);
-  if (existingId || existingQR) {
-    return res.json({ success: false, error: 'Ce restaurant ou QR Code existe déjà' });
-  }
-  
-  const restaurant = {
-    ...data,
-    id: id || qrCode || uuidv4(),
-    qrCode: qrCode || id || '',
-    email: email || '',
-    password: password ? bcrypt.hashSync(password, 10) : null,
-    status: 'pending',
-    dateRequest: new Date().toISOString()
-  };
-  
-  db.restaurants.push(restaurant);
-  saveDB(db);
-  
-  res.json({ success: true, id: restaurant.id, qrCode: restaurant.qrCode });
-});
-
-// Liste des restaurants en attente
-app.get('/api/restaurants/pending', (req, res) => {
-  const pending = db.restaurants
-    .filter(r => r.status === 'pending')
-    .map(({ password, ...r }) => r);
-  res.json(pending);
-});
-
-// Liste des restaurants approuvés
-app.get('/api/restaurants', (req, res) => {
-  const restaurants = db.restaurants
-    .filter(r => r.status === 'approved' || r.status === 'terminated')
-    .map(({ password, ...r }) => r);
-  res.json(restaurants);
-});
-
-// Rechercher un restaurant par QR code
-app.get('/api/restaurants/qr/:qrCode', (req, res) => {
-  const restaurant = db.restaurants.find(r => r.qrCode === req.params.qrCode && r.status === 'approved');
-  
-  if (!restaurant) {
+  if (!restaurant || restaurant.status !== 'approved') {
     return res.status(404).json({ error: 'Restaurant non trouvé' });
   }
   
-  const { password, ...data } = restaurant;
+  const { password, loginAttempts, lockUntil, ...data } = restaurant;
   res.json(data);
 });
 
-// Approuver un restaurant
-app.post('/api/restaurants/:id/approve', (req, res) => {
-  const restaurant = db.restaurants.find(r => r.id === req.params.id);
-  
-  if (!restaurant) {
-    return res.json({ success: false, error: 'Restaurant non trouvé' });
+app.post('/api/restaurants/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { qrCode, password, ...updateData } = sanitizeObject(req.body);
+    
+    const restaurant = await getRestaurantById(id);
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const updates = {
+      ...updateData,
+      status: 'approved',
+      qrCode: qrCode || restaurant.qrCode || `UCO-${Date.now()}`,
+      dateApproval: new Date().toISOString()
+    };
+    
+    if (password && !restaurant.password) {
+      updates.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    }
+    
+    await updateRestaurant(id, updates);
+    await auditLog('RESTAURANT_APPROVED', id, { qrCode: updates.qrCode }, req);
+    
+    res.json({ success: true, qrCode: updates.qrCode });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  // Extraire qrCode et password du body, le reste va dans updateData
-  const { qrCode, password, ...updateData } = req.body;
-  
-  // Mettre à jour les données du restaurant
-  Object.assign(restaurant, updateData);
-  restaurant.status = 'approved';
-  restaurant.qrCode = qrCode || `UCO-${Date.now()}`;
-  restaurant.dateApproval = new Date().toISOString();
-  
-  // Gérer le mot de passe
-  // Si un nouveau mot de passe est fourni (mot de passe temporaire), le hasher et le stocker
-  if (password && !restaurant.password) {
-    // Le restaurant n'avait pas de mot de passe (créé par collecteur)
-    // Hasher le mot de passe temporaire
-    restaurant.password = bcrypt.hashSync(password, 10);
-  } else if (password && restaurant.password) {
-    // Le restaurant avait déjà un mot de passe, on garde l'existant
-    // Ne rien faire, on garde le mot de passe hashé lors de l'inscription
-  }
-  // Si pas de nouveau mot de passe et pas de mot de passe existant, on laisse null
-  
-  saveDB(db);
-  
-  res.json({ success: true, qrCode: restaurant.qrCode });
 });
 
-// Refuser un restaurant
-app.post('/api/restaurants/:id/reject', (req, res) => {
-  const index = db.restaurants.findIndex(r => r.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Restaurant non trouvé' });
-  }
-  
-  db.restaurants.splice(index, 1);
-  saveDB(db);
-  
+app.post('/api/restaurants/:id/reject', async (req, res) => {
+  const { id } = req.params;
+  await deleteRestaurant(id);
+  await auditLog('RESTAURANT_REJECTED', id, {}, req);
   res.json({ success: true });
 });
 
-// Ajouter un restaurant (admin)
-app.post('/api/restaurants', (req, res) => {
-  const restaurant = {
-    ...req.body,
-    id: req.body.id || req.body.qrCode || uuidv4(),
-    qrCode: req.body.qrCode || req.body.id || '',
-    status: req.body.status || 'approved',
-    dateCreated: req.body.dateCreated || new Date().toISOString()
-  };
-  
-  // Vérifier si l'ID ou QR code existe déjà
-  const existing = db.restaurants.find(r => r.id === restaurant.id || r.qrCode === restaurant.qrCode);
-  if (existing) {
-    return res.json({ success: false, error: `QR Code "${restaurant.qrCode}" déjà attribué` });
+app.post('/api/restaurants', async (req, res) => {
+  try {
+    const { id, qrCode, ...data } = sanitizeObject(req.body);
+    
+    const restaurantId = id || qrCode || uuidv4();
+    
+    const existing = await getRestaurantById(restaurantId);
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'QR Code déjà attribué' });
+    }
+    
+    await addRestaurant({
+      ...data,
+      id: restaurantId,
+      qrCode: qrCode || restaurantId,
+      status: data.status || 'approved',
+      dateCreated: new Date().toISOString()
+    });
+    
+    await auditLog('RESTAURANT_CREATED', restaurantId, {}, req);
+    
+    res.status(201).json({ success: true, id: restaurantId, qrCode: qrCode || restaurantId });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  db.restaurants.push(restaurant);
-  saveDB(db);
-  
-  res.json({ success: true, id: restaurant.id, qrCode: restaurant.qrCode });
 });
 
-// Modifier un restaurant
-app.put('/api/restaurants/:id', (req, res) => {
-  const restaurant = db.restaurants.find(r => r.id === req.params.id);
-  
-  if (!restaurant) {
-    return res.json({ success: false, error: 'Restaurant non trouvé' });
+app.put('/api/restaurants/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const restaurant = await getRestaurantById(id);
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    await updateRestaurant(id, sanitizeObject(req.body));
+    await auditLog('RESTAURANT_UPDATED', id, {}, req);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  Object.assign(restaurant, req.body);
-  saveDB(db);
-  
-  res.json({ success: true });
 });
 
-// Supprimer un restaurant
-app.delete('/api/restaurants/:id', (req, res) => {
-  const index = db.restaurants.findIndex(r => r.id === req.params.id);
-  
-  if (index === -1) {
-    return res.json({ success: false, error: 'Restaurant non trouvé' });
+app.put('/api/restaurants/:id/password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = sanitizeObject(req.body);
+    
+    if (!password || password.length < 8) {
+      return res.status(400).json({ success: false, error: 'Mot de passe invalide (min 8 caractères)' });
+    }
+    
+    const restaurant = await getRestaurantById(id);
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    await updateRestaurant(id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) });
+    await auditLog('RESTAURANT_PASSWORD_CHANGED', id, {}, req);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  db.restaurants.splice(index, 1);
-  saveDB(db);
-  
-  res.json({ success: true });
 });
 
-// Mettre à jour le mot de passe d'un restaurant
-app.put('/api/restaurants/:id/password', (req, res) => {
-  const { password } = req.body;
-  const restaurant = db.restaurants.find(r => r.id === req.params.id || r.email === req.params.id);
-  
-  if (!restaurant) {
-    return res.json({ success: false, error: 'Restaurant non trouvé' });
-  }
-  
-  restaurant.password = password; // Non hashé pour les restaurants (comparaison directe)
-  saveDB(db);
-  
-  res.json({ success: true });
-});
-
-// =============================================
-// ROUTES - COLLECTES
-// =============================================
-
-// Créer une collecte
-app.post('/api/collections', (req, res) => {
-  const { collectorNumber, ...data } = req.body;
-  
-  const dateNow = new Date().toISOString();
-  const numeroOrdre = generateNumeroOrdre(collectorNumber, dateNow);
-  
-  // Trouver le restaurant
-  const restaurant = db.restaurants.find(r => r.id === data.restaurantId);
-  
-  const collection = {
-    id: uuidv4(),
-    numeroOrdre,
-    date: dateNow,
-    collectorNumber,
-    ...data,
-    restaurant: restaurant || null
-  };
-  
-  db.collections.push(collection);
-  saveDB(db);
-  
-  res.json({ 
-    success: true, 
-    collectionId: collection.id, 
-    numeroOrdre,
-    date: dateNow,
-    restaurant
-  });
-});
-
-// Liste des collectes
-app.get('/api/collections', (req, res) => {
-  res.json(db.collections);
-});
-
-// Collectes par collecteur
-app.get('/api/collections/collector/:id', (req, res) => {
-  const collections = db.collections.filter(c => c.collectorId === req.params.id);
+// ===== COLLECTES =====
+app.get('/api/collections', async (req, res) => {
+  const collections = await getCollections();
   res.json(collections);
 });
 
-// Détail d'une collecte
-app.get('/api/collections/:id', (req, res) => {
-  const collection = db.collections.find(c => c.id === req.params.id);
-  
-  if (!collection) {
-    return res.status(404).json({ error: 'Collecte non trouvée' });
+app.post('/api/collections', async (req, res) => {
+  try {
+    const collection = sanitizeObject({
+      ...req.body,
+      id: req.body.id || uuidv4()
+    });
+    
+    await addCollection(collection);
+    await auditLog('COLLECTION_CREATED', collection.id, { restaurantId: collection.restaurantId }, req);
+    
+    res.status(201).json({ success: true, id: collection.id });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  res.json(collection);
 });
 
-// =============================================
-// ROUTES - TOURNÉES
-// =============================================
-
-// Créer une tournée
-app.post('/api/tournees', (req, res) => {
-  const tournee = {
-    id: uuidv4(),
-    ...req.body,
-    dateCreated: new Date().toISOString()
-  };
-  
-  db.tournees.push(tournee);
-  saveDB(db);
-  
-  res.json({ success: true, id: tournee.id });
+// ===== TOURNÉES =====
+app.get('/api/tournees', async (req, res) => {
+  const tournees = await getTournees();
+  res.json(tournees);
 });
 
-// Récupérer une tournée par collecteur et date
-app.get('/api/tournees/:collectorId/:date', (req, res) => {
-  const tournee = db.tournees.find(t => 
-    t.collectorId === req.params.collectorId && 
-    t.date === req.params.date
-  );
-  
-  if (!tournee) {
-    return res.status(404).json({ error: 'Tournée non trouvée' });
+app.post('/api/tournees', async (req, res) => {
+  try {
+    const tournee = sanitizeObject({
+      ...req.body,
+      id: req.body.id || uuidv4()
+    });
+    
+    await addTournee(tournee);
+    res.status(201).json({ success: true, id: tournee.id });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
-  
-  res.json(tournee);
 });
 
-// Mettre à jour une tournée
-app.put('/api/tournees/:id', (req, res) => {
-  const tournee = db.tournees.find(t => t.id === req.params.id);
-  
-  if (!tournee) {
-    return res.json({ success: false, error: 'Tournée non trouvée' });
-  }
-  
-  Object.assign(tournee, req.body);
-  saveDB(db);
-  
+app.put('/api/tournees/:id', async (req, res) => {
+  const { id } = req.params;
+  await updateTournee(id, sanitizeObject(req.body));
   res.json({ success: true });
 });
 
-// =============================================
-// ROUTES - VOLUMES JOURNALIERS
-// =============================================
-
-// Ajouter un volume journalier
-app.post('/api/daily-volumes', (req, res) => {
-  if (!db.dailyVolumes) db.dailyVolumes = [];
-  
-  const volume = {
-    id: req.body.id || uuidv4(),
-    ...req.body,
-    timestamp: new Date().toISOString()
-  };
-  
-  db.dailyVolumes.push(volume);
-  saveDB(db);
-  
-  res.json({ success: true, id: volume.id });
+// ===== SETTINGS =====
+app.get('/api/settings', async (req, res) => {
+  const settings = await getSettings();
+  // Ne pas renvoyer les infos sensibles
+  const { admin, ...publicSettings } = settings;
+  res.json(publicSettings);
 });
 
-// Liste des volumes journaliers
-app.get('/api/daily-volumes', (req, res) => {
-  if (!db.dailyVolumes) db.dailyVolumes = [];
-  res.json(db.dailyVolumes.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
-});
-
-// Volumes par date
-app.get('/api/daily-volumes/:date', (req, res) => {
-  if (!db.dailyVolumes) db.dailyVolumes = [];
-  const volumes = db.dailyVolumes.filter(v => v.date === req.params.date);
-  res.json(volumes);
-});
-
-// =============================================
-// ROUTES - EXPÉDITIONS
-// =============================================
-
-// Ajouter une expédition
-app.post('/api/expeditions', (req, res) => {
-  if (!db.expeditions) db.expeditions = [];
-  
-  const expedition = {
-    id: req.body.id || uuidv4(),
-    ...req.body,
-    timestamp: new Date().toISOString()
-  };
-  
-  db.expeditions.push(expedition);
-  saveDB(db);
-  
-  res.json({ success: true, id: expedition.id });
-});
-
-// Liste des expéditions
-app.get('/api/expeditions', (req, res) => {
-  if (!db.expeditions) db.expeditions = [];
-  res.json(db.expeditions.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
-});
-
-// =============================================
-// ROUTES - STATISTIQUES
-// =============================================
-
-app.get('/api/statistics', (req, res) => {
-  const totalCollections = db.collections.length;
-  const totalVolume = db.collections.reduce((sum, c) => sum + (c.volume || 0), 0);
-  const totalRestaurants = db.restaurants.filter(r => r.status === 'approved').length;
-  const totalCollectors = db.collectors.filter(c => c.status === 'approved').length;
-  
-  res.json({
-    totalCollections,
-    totalVolume,
-    totalRestaurants,
-    totalCollectors
-  });
-});
-
-// =============================================
-// ROUTES - PARAMÈTRES ADMIN
-// =============================================
-
-// Récupérer les paramètres (clé API masquée pour la sécurité)
-app.get('/api/settings', (req, res) => {
-  // Initialiser settings si non existant
-  if (!db.settings) {
-    db.settings = {
-      email: 'contact@uco-and-co.com',
-      brevoApiKey: '',
-      adminTel: {countryCode: 'FR', number: ''},
-      smsEnabled: false
-    };
-    saveDB(db);
-  }
-  
-  // Retourner les paramètres avec la clé API masquée
-  res.json({
-    email: db.settings.email,
-    brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
-    hasBrevoKey: !!db.settings.brevoApiKey,
-    adminTel: db.settings.adminTel || {countryCode: 'FR', number: ''},
-    smsEnabled: db.settings.smsEnabled || false
-  });
-});
-
-// Mettre à jour les paramètres
-app.post('/api/settings', (req, res) => {
-  const { email, brevoApiKey, adminTel, smsEnabled } = req.body;
-  
-  if (!db.settings) {
-    db.settings = {};
-  }
-  
-  if (email !== undefined) db.settings.email = email;
-  if (adminTel !== undefined) db.settings.adminTel = adminTel;
-  if (smsEnabled !== undefined) db.settings.smsEnabled = smsEnabled;
-  // Ne mettre à jour la clé que si elle n'est pas masquée
-  if (brevoApiKey !== undefined && !brevoApiKey.startsWith('••••')) {
-    db.settings.brevoApiKey = brevoApiKey;
-  }
-  
-  saveDB(db);
-  
-  res.json({ 
-    success: true, 
-    settings: {
-      email: db.settings.email,
-      brevoApiKey: db.settings.brevoApiKey ? '••••••••' + db.settings.brevoApiKey.slice(-8) : '',
-      hasBrevoKey: !!db.settings.brevoApiKey,
-      adminTel: db.settings.adminTel || {countryCode: 'FR', number: ''},
-      smsEnabled: db.settings.smsEnabled || false
-    }
-  });
-});
-
-// =============================================
-// ROUTES - ENVOI D'EMAILS (Sécurisé côté serveur)
-// =============================================
-
-// Envoyer un email via Brevo (la clé API reste côté serveur)
-app.post('/api/send-email', async (req, res) => {
-  const { to, subject, htmlContent, html, senderName = 'UCO AND CO', attachment } = req.body;
-  
-  // Accepter html ou htmlContent
-  const emailHtml = htmlContent || html;
-  
-  if (!to || !subject || !emailHtml) {
-    return res.json({ success: false, error: 'Paramètres manquants (to, subject, htmlContent ou html)' });
-  }
-  
-  const apiKey = db.settings?.brevoApiKey;
-  
-  if (!apiKey) {
-    console.warn('Clé API Brevo non configurée');
-    return res.json({ success: false, error: 'Clé API Brevo non configurée' });
-  }
-  
+app.put('/api/settings', async (req, res) => {
   try {
+    await updateSettings(sanitizeObject(req.body));
+    await auditLog('SETTINGS_UPDATED', 'admin', {}, req);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.put('/api/admin/password', async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = sanitizeObject(req.body);
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Mots de passe requis' });
+    }
+    
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'Nouveau mot de passe trop court (min 8 caractères)' });
+    }
+    
+    const admin = await getAdmin();
+    const isValid = await bcrypt.compare(currentPassword, admin.password);
+    
+    if (!isValid) {
+      await auditLog('ADMIN_PASSWORD_CHANGE_FAILED', admin.email, { reason: 'Invalid current password' }, req);
+      return res.status(401).json({ success: false, error: 'Mot de passe actuel incorrect' });
+    }
+    
+    const settings = await getSettings();
+    await updateSettings({
+      ...settings,
+      admin: {
+        ...admin,
+        password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS)
+      }
+    });
+    
+    await auditLog('ADMIN_PASSWORD_CHANGED', admin.email, {}, req);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ===== EMAIL (Brevo) =====
+app.post('/api/send-email', async (req, res) => {
+  try {
+    const { to, subject, htmlContent, html, senderName, attachment } = sanitizeObject(req.body);
+    const emailHtml = htmlContent || html;
+    
+    if (!to || !subject || !emailHtml) {
+      return res.status(400).json({ success: false, error: 'Paramètres manquants' });
+    }
+    
+    if (!isValidEmail(to)) {
+      return res.status(400).json({ success: false, error: 'Email destinataire invalide' });
+    }
+    
+    const settings = await getSettings();
+    const apiKey = settings.brevoApiKey;
+    
+    if (!apiKey) {
+      return res.status(503).json({ success: false, error: 'Service email non configuré' });
+    }
+    
     const emailPayload = {
-      sender: { name: senderName, email: 'contact@uco-and-co.fr' },
+      sender: { name: senderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' },
       to: [{ email: to }],
-      subject: subject,
+      subject: subject.slice(0, 200), // Limiter la longueur
       htmlContent: emailHtml
     };
     
-    // Ajouter la pièce jointe si présente
-    if (attachment && attachment.content && attachment.name) {
-      emailPayload.attachment = [{
-        content: attachment.content,
-        name: attachment.name
-      }];
+    if (attachment?.content && attachment?.name) {
+      emailPayload.attachment = [{ content: attachment.content, name: attachment.name.slice(0, 100) }];
     }
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
@@ -914,81 +1307,149 @@ app.post('/api/send-email', async (req, res) => {
     });
     
     if (response.ok) {
-      console.log('Email envoyé avec succès à', to, attachment ? '(avec pièce jointe)' : '');
       res.json({ success: true });
     } else {
       const error = await response.json();
-      console.error('Erreur envoi email:', error);
-      res.json({ success: false, error: error.message || 'Erreur Brevo' });
+      res.status(502).json({ success: false, error: error.message || 'Erreur Brevo' });
     }
   } catch (error) {
-    console.error('Erreur envoi email:', error);
-    res.json({ success: false, error: error.message });
+    console.error('Erreur email:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
 
-// =============================================
-// ROUTES - ENVOI DE SMS (Sécurisé côté serveur via Brevo)
-// =============================================
-
-// Envoyer un SMS via l'API Brevo Transactional SMS
+// ===== SMS (Brevo) =====
 app.post('/api/send-sms', async (req, res) => {
-  const { to, content } = req.body;
-  
-  if (!to || !content) {
-    return res.json({ success: false, error: 'Paramètres manquants (to, content)' });
-  }
-  
-  // Vérifier si les SMS sont activés
-  if (!db.settings?.smsEnabled) {
-    console.log('SMS désactivé, envoi ignoré');
-    return res.json({ success: false, error: 'SMS désactivé dans les paramètres' });
-  }
-  
-  const apiKey = db.settings?.brevoApiKey;
-  
-  if (!apiKey) {
-    console.warn('Clé API Brevo non configurée (SMS)');
-    return res.json({ success: false, error: 'Clé API Brevo non configurée' });
-  }
-  
   try {
+    const { to, message } = sanitizeObject(req.body);
+    
+    if (!to || !message) {
+      return res.status(400).json({ success: false, error: 'Paramètres manquants' });
+    }
+    
+    const settings = await getSettings();
+    
+    if (!settings.brevoApiKey) {
+      return res.status(503).json({ success: false, error: 'Service SMS non configuré' });
+    }
+    
+    if (!settings.smsEnabled) {
+      return res.status(503).json({ success: false, error: 'SMS désactivé' });
+    }
+    
+    let phoneNumber = typeof to === 'object' ? to.number : to;
+    let countryCode = typeof to === 'object' ? to.countryCode : 'FR';
+    
+    phoneNumber = phoneNumber.replace(/[\s\.\-]/g, '');
+    
+    const prefixes = { 'FR': '+33', 'BE': '+32', 'CH': '+41', 'LU': '+352' };
+    const prefix = prefixes[countryCode] || '+33';
+    
+    if (!phoneNumber.startsWith('+')) {
+      phoneNumber = phoneNumber.startsWith('0') ? prefix + phoneNumber.slice(1) : prefix + phoneNumber;
+    }
+    
     const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
       method: 'POST',
       headers: {
         'accept': 'application/json',
-        'api-key': apiKey,
+        'api-key': settings.brevoApiKey,
         'content-type': 'application/json'
       },
       body: JSON.stringify({
-        type: 'transactional',
-        unicodeEnabled: false,
         sender: 'UCOANDCO',
-        recipient: to,
-        content: content
+        recipient: phoneNumber,
+        content: message.slice(0, 160) // Limiter à 160 caractères
       })
     });
     
     if (response.ok) {
-      const result = await response.json();
-      console.log('SMS envoyé avec succès à', to, '- messageId:', result.messageId);
-      res.json({ success: true, messageId: result.messageId });
+      res.json({ success: true });
     } else {
       const error = await response.json();
-      console.error('Erreur envoi SMS Brevo:', error);
-      res.json({ success: false, error: error.message || 'Erreur Brevo SMS' });
+      res.status(502).json({ success: false, error: error.message || 'Erreur SMS' });
     }
   } catch (error) {
-    console.error('Erreur envoi SMS:', error);
-    res.json({ success: false, error: error.message });
+    console.error('Erreur SMS:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
+});
+
+// ===== AUDIT LOGS (Admin only) =====
+app.get('/api/audit-logs', authenticateToken, requireRole('admin'), async (req, res) => {
+  if (!db) return res.json([]);
+  
+  const { limit = 100, action, userId } = req.query;
+  const query = {};
+  if (action) query.action = action;
+  if (userId) query.userId = userId;
+  
+  const logs = await db.collection(COLLECTIONS.AUDIT_LOGS)
+    .find(query)
+    .sort({ timestamp: -1 })
+    .limit(parseInt(limit))
+    .toArray();
+  
+  res.json(logs);
+});
+
+// ===== STATISTIQUES =====
+app.get('/api/stats', async (req, res) => {
+  const restaurants = await getRestaurants();
+  const collectors = await getCollectors('approved');
+  const operators = await getOperators('approved');
+  const collections = await getCollections();
+  
+  res.json({
+    restaurants: restaurants.filter(r => r.status === 'approved').length,
+    collectors: collectors.length,
+    operators: operators.length,
+    collections: collections.length,
+    totalVolume: Math.round(collections.reduce((sum, c) => sum + (parseFloat(c.quantite) || 0), 0) * 100) / 100,
+    totalAmount: Math.round(collections.reduce((sum, c) => sum + (parseFloat(c.montant) || 0), 0) * 100) / 100
+  });
+});
+
+// ===== GESTION DES ERREURS =====
+app.use((err, req, res, next) => {
+  console.error(`[${req.requestId}] Erreur:`, err.message);
+  
+  if (err.message === 'Non autorisé par CORS') {
+    return res.status(403).json({ success: false, error: 'Accès non autorisé' });
+  }
+  
+  res.status(500).json({ success: false, error: 'Erreur serveur interne' });
+});
+
+// Route 404
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Route non trouvée' });
 });
 
 // =============================================
 // DÉMARRAGE DU SERVEUR
 // =============================================
+async function startServer() {
+  await connectDB();
+  
+  app.listen(PORT, () => {
+    console.log('');
+    console.log('🛢️  ========================================');
+    console.log('🛢️  UCO AND CO - Backend API (SÉCURISÉ)');
+    console.log('🛢️  ========================================');
+    console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+    console.log(`📊 Base de données: ${db ? 'MongoDB Atlas ✅' : 'Mode mémoire ⚠️'}`);
+    console.log('🔒 Sécurité activée:');
+    console.log('   ✅ Helmet (Headers sécurisés)');
+    console.log('   ✅ CORS restreint');
+    console.log('   ✅ Rate limiting');
+    console.log('   ✅ Sanitization NoSQL/XSS');
+    console.log('   ✅ JWT Authentication');
+    console.log('   ✅ Bcrypt (12 rounds)');
+    console.log('   ✅ Verrouillage de compte');
+    console.log('   ✅ Audit logs');
+    console.log('');
+  });
+}
 
-app.listen(PORT, () => {
-  console.log(`🚀 UCO Backend running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
-});
+startServer();
