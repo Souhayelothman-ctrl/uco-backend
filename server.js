@@ -1313,14 +1313,20 @@ app.put('/api/admin/password', async (req, res) => {
 // ===== EMAIL (Brevo) =====
 app.post('/api/send-email', async (req, res) => {
   try {
-    const { to, subject, htmlContent, html, senderName, attachment } = sanitizeObject(req.body);
+    // Ne PAS sanitizer htmlContent car c'est du HTML valide
+    const { to, subject, htmlContent, html, senderName, attachment } = req.body;
     const emailHtml = htmlContent || html;
     
-    if (!to || !subject || !emailHtml) {
+    // Sanitizer uniquement les champs sensibles (pas le HTML)
+    const safeTo = sanitizeInput(to);
+    const safeSubject = sanitizeInput(subject);
+    const safeSenderName = sanitizeInput(senderName);
+    
+    if (!safeTo || !safeSubject || !emailHtml) {
       return res.status(400).json({ success: false, error: 'Paramètres manquants' });
     }
     
-    if (!isValidEmail(to)) {
+    if (!isValidEmail(safeTo)) {
       return res.status(400).json({ success: false, error: 'Email destinataire invalide' });
     }
     
@@ -1332,14 +1338,14 @@ app.post('/api/send-email', async (req, res) => {
     }
     
     const emailPayload = {
-      sender: { name: senderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' },
-      to: [{ email: to }],
-      subject: subject.slice(0, 200), // Limiter la longueur
-      htmlContent: emailHtml
+      sender: { name: safeSenderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' },
+      to: [{ email: safeTo }],
+      subject: safeSubject.slice(0, 200),
+      htmlContent: emailHtml // Garder le HTML intact
     };
     
     if (attachment?.content && attachment?.name) {
-      emailPayload.attachment = [{ content: attachment.content, name: attachment.name.slice(0, 100) }];
+      emailPayload.attachment = [{ content: attachment.content, name: sanitizeInput(attachment.name).slice(0, 100) }];
     }
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
