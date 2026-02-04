@@ -1076,40 +1076,77 @@ app.post('/api/restaurants/register', async (req, res) => {
       existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
     }
     
-    // Vérifier l'email seulement si ce n'est PAS une réinscription du même SIRET
-    if (email) {
-      const existingByEmail = await getRestaurantByEmail(email);
-      if (existingByEmail) {
-        // Si l'email existe mais pour un SIRET différent → erreur
-        if (!existingBySiret || existingByEmail.siret !== siret) {
-          return res.status(409).json({ success: false, error: 'Email déjà utilisé par un autre restaurant' });
-        }
-        // Si c'est le même SIRET → c'est une réinscription, on permet
-      }
-    }
-    
-    // Si le SIRET existe déjà, on met à jour au lieu de créer
+    // Si le SIRET existe déjà
     if (existingBySiret) {
-      // Réinscription : mettre à jour le restaurant existant
+      // Cas 1: Restaurant créé par admin sans mot de passe → Le restaurant finalise son compte
+      // Cas 2: Restaurant résilié qui veut se réinscrire
+      // Dans les deux cas, on permet la mise à jour
+      
+      // Vérifier si l'email est différent ET appartient à un autre restaurant
+      if (email && email !== existingBySiret.email) {
+        const existingByEmail = await getRestaurantByEmail(email);
+        if (existingByEmail && existingByEmail.siret !== siret) {
+          return res.status(409).json({ success: false, error: 'Cet email est déjà utilisé par un autre restaurant' });
+        }
+      }
+      
+      // Déterminer si c'est une finalisation de compte (ajout de mot de passe) ou une réinscription
+      const isAccountFinalization = !existingBySiret.password && password;
+      const isResubmission = existingBySiret.status === 'terminated';
+      
+      // Préparer les données de mise à jour
       const updateData = {
         ...data,
         email: email || existingBySiret.email,
-        password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : existingBySiret.password,
-        status: 'pending',
-        dateRequest: new Date().toISOString(),
-        isResubmission: true // Marquer comme réinscription
+        dateRequest: new Date().toISOString()
       };
       
+      // Ajouter le mot de passe hashé si fourni
+      if (password) {
+        updateData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      }
+      
+      // Déterminer le nouveau statut
+      if (isAccountFinalization && existingBySiret.status === 'approved') {
+        // Compte déjà approuvé, juste besoin du mot de passe → reste approved
+        updateData.status = 'approved';
+        updateData.passwordSetDate = new Date().toISOString();
+      } else {
+        // Réinscription ou nouveau compte → passe en pending
+        updateData.status = 'pending';
+        updateData.isResubmission = isResubmission;
+      }
+      
       await updateRestaurant(existingBySiret.id, updateData);
-      await auditLog('RESTAURANT_RESUBMIT', email || existingBySiret.id, { status: 'pending', siret }, req);
+      
+      const logAction = isAccountFinalization ? 'RESTAURANT_FINALIZE_ACCOUNT' : 'RESTAURANT_RESUBMIT';
+      await auditLog(logAction, email || existingBySiret.id, { 
+        status: updateData.status, 
+        siret,
+        isAccountFinalization,
+        isResubmission
+      }, req);
       
       return res.status(200).json({ 
         success: true, 
         id: existingBySiret.id, 
         qrCode: existingBySiret.qrCode || existingBySiret.id,
-        isResubmission: true,
-        message: 'Demande de réinscription soumise'
+        isAccountFinalization,
+        isResubmission,
+        status: updateData.status,
+        message: isAccountFinalization 
+          ? 'Compte finalisé avec succès' 
+          : 'Demande de réinscription soumise'
       });
+    }
+    
+    // Nouveau restaurant (SIRET non existant)
+    // Vérifier si l'email est déjà utilisé
+    if (email) {
+      const existingByEmail = await getRestaurantByEmail(email);
+      if (existingByEmail) {
+        return res.status(409).json({ success: false, error: 'Cet email est déjà utilisé' });
+      }
     }
     
     const restaurantId = id || qrCode || uuidv4();
