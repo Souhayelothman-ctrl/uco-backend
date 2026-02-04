@@ -1480,20 +1480,19 @@ app.put('/api/admin/password', async (req, res) => {
 // ===== EMAIL (Brevo) =====
 app.post('/api/send-email', async (req, res) => {
   try {
-    // Ne PAS sanitizer htmlContent car c'est du HTML valide
     const { to, subject, htmlContent, html, senderName, attachment } = req.body;
-    const emailHtml = htmlContent || html;
     
-    // Sanitizer uniquement les champs sensibles (pas le HTML)
-    const safeTo = sanitizeInput(to);
-    const safeSubject = sanitizeInput(subject);
-    const safeSenderName = sanitizeInput(senderName);
+    // Récupérer le HTML
+    let emailHtml = htmlContent || html;
     
-    if (!safeTo || !safeSubject || !emailHtml) {
+    // Validation basique (sans sanitization du HTML)
+    if (!to || !subject || !emailHtml) {
       return res.status(400).json({ success: false, error: 'Paramètres manquants' });
     }
     
-    if (!isValidEmail(safeTo)) {
+    // Valider l'email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(to)) {
       return res.status(400).json({ success: false, error: 'Email destinataire invalide' });
     }
     
@@ -1504,16 +1503,40 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
+    // IMPORTANT: Compacter le HTML (supprimer retours à la ligne et espaces excessifs)
+    // Cela résout le problème d'affichage HTML brut dans les emails
+    const compactHtml = emailHtml
+      .replace(/\n/g, '')           // Supprimer tous les retours à la ligne
+      .replace(/\r/g, '')           // Supprimer les retours chariot
+      .replace(/\t/g, '')           // Supprimer les tabulations
+      .replace(/>\s+</g, '><')      // Supprimer les espaces entre les balises
+      .replace(/\s{2,}/g, ' ')      // Réduire les espaces multiples à un seul
+      .trim();
+    
+    // Construire le payload pour Brevo
     const emailPayload = {
-      sender: { name: safeSenderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' },
-      to: [{ email: safeTo }],
-      subject: safeSubject.slice(0, 200),
-      htmlContent: emailHtml // Garder le HTML intact
+      sender: { 
+        name: senderName || 'UCO AND CO', 
+        email: 'contact@uco-and-co.fr' 
+      },
+      to: [{ email: to }],
+      subject: subject.substring(0, 200),
+      htmlContent: compactHtml
     };
     
-    if (attachment?.content && attachment?.name) {
-      emailPayload.attachment = [{ content: attachment.content, name: sanitizeInput(attachment.name).slice(0, 100) }];
+    // Ajouter une pièce jointe si présente
+    if (attachment && attachment.content && attachment.name) {
+      emailPayload.attachment = [{ 
+        content: attachment.content, 
+        name: attachment.name.substring(0, 100) 
+      }];
     }
+    
+    console.log('=== ENVOI EMAIL BREVO ===');
+    console.log('To:', to);
+    console.log('Subject:', subject);
+    console.log('HTML original length:', emailHtml.length);
+    console.log('HTML compact length:', compactHtml.length);
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -1525,11 +1548,14 @@ app.post('/api/send-email', async (req, res) => {
       body: JSON.stringify(emailPayload)
     });
     
+    const responseData = await response.json();
+    
     if (response.ok) {
-      res.json({ success: true });
+      console.log('Email envoyé avec succès, messageId:', responseData.messageId);
+      res.json({ success: true, messageId: responseData.messageId });
     } else {
-      const error = await response.json();
-      res.status(502).json({ success: false, error: error.message || 'Erreur Brevo' });
+      console.error('Erreur Brevo:', responseData);
+      res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo' });
     }
   } catch (error) {
     console.error('Erreur email:', error);
