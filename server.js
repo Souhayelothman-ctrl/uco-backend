@@ -98,11 +98,14 @@ app.use('/api/', generalLimiter);
 app.use('/api/auth/', authLimiter);
 app.use('/api/password-reset', strictLimiter);
 
-// 4. Body parser avec limite
+// 4. Trust proxy (requis pour Render et le rate limiting)
+app.set('trust proxy', 1);
+
+// 5. Body parser avec limite
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// 5. Sanitization contre les injections NoSQL
+// 6. Sanitization contre les injections NoSQL
 app.use(mongoSanitize({
   replaceWith: '_',
   onSanitize: ({ req, key }) => {
@@ -1696,7 +1699,12 @@ app.post('/api/send-sms', async (req, res) => {
       res.json({ success: true, messageId: responseData.messageId });
     } else {
       console.log('Erreur Brevo SMS:', responseData);
-      res.status(502).json({ success: false, error: responseData.message || 'Erreur SMS Brevo', details: responseData });
+      // Message d'erreur explicite selon le code
+      let errorMsg = responseData.message || 'Erreur SMS Brevo';
+      if (responseData.code === 'not_enough_credits') {
+        errorMsg = 'Crédits SMS insuffisants. Achetez des crédits sur Brevo.';
+      }
+      res.status(502).json({ success: false, error: errorMsg, code: responseData.code });
     }
   } catch (error) {
     console.error('Erreur SMS:', error);
