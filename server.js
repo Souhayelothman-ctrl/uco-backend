@@ -1537,15 +1537,13 @@ app.post('/api/send-email', async (req, res) => {
   try {
     const { to, subject, htmlContent, html, senderName, attachment } = req.body;
     
-    // Récupérer le HTML
-    let emailHtml = htmlContent || html;
+    // Récupérer le HTML brut du frontend
+    const rawHtml = htmlContent || html;
     
-    // Validation basique (sans sanitization du HTML)
-    if (!to || !subject || !emailHtml) {
+    if (!to || !subject || !rawHtml) {
       return res.status(400).json({ success: false, error: 'Paramètres manquants' });
     }
     
-    // Valider l'email
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(to)) {
       return res.status(400).json({ success: false, error: 'Email destinataire invalide' });
@@ -1558,28 +1556,20 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
-    // IMPORTANT: Nettoyer le HTML de manière agressive
-    // Supprimer TOUT ce qui précède <!DOCTYPE
-    let cleanHtml = emailHtml;
-    const doctypeIndex = cleanHtml.indexOf('<!DOCTYPE');
-    if (doctypeIndex > 0) {
-      cleanHtml = cleanHtml.substring(doctypeIndex);
-    }
+    // SOLUTION : Extraire le contenu du body et reconstruire le HTML côté serveur
+    // Le problème vient du transit frontend→backend qui corrompt le HTML
+    let finalHtml;
     
-    // Nettoyer aussi les caractères invisibles restants
-    cleanHtml = cleanHtml
-      .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Supprimer caractères de contrôle
-      .replace(/[\u200B-\u200D\uFEFF]/g, '')        // Supprimer zero-width et BOM
-      .replace(/\n/g, '')
-      .replace(/\r/g, '')
-      .replace(/\t/g, '')
-      .replace(/>\s+</g, '><')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-    
-    // S'assurer que le HTML commence bien par <!DOCTYPE
-    if (!cleanHtml.startsWith('<!DOCTYPE')) {
-      console.log('WARNING: HTML ne commence pas par <!DOCTYPE, préfixe:', cleanHtml.substring(0, 20));
+    // Extraire le contenu entre <body...> et </body>
+    const bodyMatch = rawHtml.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+    if (bodyMatch) {
+      // Reconstruire un HTML propre côté serveur (comme le test qui fonctionne)
+      const bodyContent = bodyMatch[1].replace(/[\r\n\t]/g, '').replace(/\s{2,}/g, ' ').trim();
+      finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;font-family:Arial,sans-serif;">' + bodyContent + '</body></html>';
+    } else {
+      // Pas de balise body trouvée, utiliser le contenu tel quel enveloppé dans un HTML simple
+      const content = rawHtml.replace(/<\/?html[^>]*>|<\/?head[^>]*>|<\/?body[^>]*>|<!DOCTYPE[^>]*>|<meta[^>]*>/gi, '').replace(/[\r\n\t]/g, '').replace(/\s{2,}/g, ' ').trim();
+      finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;font-family:Arial,sans-serif;">' + content + '</body></html>';
     }
     
     // Construire le payload pour Brevo
@@ -1590,7 +1580,7 @@ app.post('/api/send-email', async (req, res) => {
       },
       to: [{ email: to }],
       subject: subject.substring(0, 200),
-      htmlContent: cleanHtml
+      htmlContent: finalHtml
     };
     
     // Ajouter une pièce jointe si présente
@@ -1604,8 +1594,8 @@ app.post('/api/send-email', async (req, res) => {
     console.log('=== ENVOI EMAIL BREVO ===');
     console.log('To:', to);
     console.log('Subject:', subject);
-    console.log('HTML starts with:', cleanHtml.substring(0, 30));
-    console.log('HTML length:', cleanHtml.length);
+    console.log('HTML starts with:', finalHtml.substring(0, 80));
+    console.log('HTML length:', finalHtml.length);
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
