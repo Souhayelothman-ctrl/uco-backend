@@ -1503,20 +1503,29 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
-    // IMPORTANT: Nettoyer le HTML
-    // 1. Supprimer le BOM (Byte Order Mark) UTF-8 qui empêche Brevo de reconnaître le HTML
-    // 2. Supprimer les caractères invisibles
-    // 3. Compacter le HTML
-    const cleanHtml = emailHtml
-      .replace(/^\uFEFF/, '')       // Supprimer BOM UTF-8 au début
-      .replace(/\uFEFF/g, '')       // Supprimer tous les BOM
-      .replace(/[\u200B-\u200D\uFEFF]/g, '') // Supprimer zero-width spaces
-      .replace(/\n/g, '')           // Supprimer tous les retours à la ligne
-      .replace(/\r/g, '')           // Supprimer les retours chariot
-      .replace(/\t/g, '')           // Supprimer les tabulations
-      .replace(/>\s+</g, '><')      // Supprimer les espaces entre les balises
-      .replace(/\s{2,}/g, ' ')      // Réduire les espaces multiples à un seul
+    // IMPORTANT: Nettoyer le HTML de manière agressive
+    // Supprimer TOUT ce qui précède <!DOCTYPE
+    let cleanHtml = emailHtml;
+    const doctypeIndex = cleanHtml.indexOf('<!DOCTYPE');
+    if (doctypeIndex > 0) {
+      cleanHtml = cleanHtml.substring(doctypeIndex);
+    }
+    
+    // Nettoyer aussi les caractères invisibles restants
+    cleanHtml = cleanHtml
+      .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // Supprimer caractères de contrôle
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')        // Supprimer zero-width et BOM
+      .replace(/\n/g, '')
+      .replace(/\r/g, '')
+      .replace(/\t/g, '')
+      .replace(/>\s+</g, '><')
+      .replace(/\s{2,}/g, ' ')
       .trim();
+    
+    // S'assurer que le HTML commence bien par <!DOCTYPE
+    if (!cleanHtml.startsWith('<!DOCTYPE')) {
+      console.log('WARNING: HTML ne commence pas par <!DOCTYPE, préfixe:', cleanHtml.substring(0, 20));
+    }
     
     // Construire le payload pour Brevo
     const emailPayload = {
@@ -1540,7 +1549,7 @@ app.post('/api/send-email', async (req, res) => {
     console.log('=== ENVOI EMAIL BREVO ===');
     console.log('To:', to);
     console.log('Subject:', subject);
-    console.log('HTML starts with:', cleanHtml.substring(0, 50));
+    console.log('HTML starts with:', cleanHtml.substring(0, 30));
     console.log('HTML length:', cleanHtml.length);
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
