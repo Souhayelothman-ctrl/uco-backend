@@ -1503,9 +1503,14 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
-    // IMPORTANT: Compacter le HTML (supprimer retours à la ligne et espaces excessifs)
-    // Cela résout le problème d'affichage HTML brut dans les emails
-    const compactHtml = emailHtml
+    // IMPORTANT: Nettoyer le HTML
+    // 1. Supprimer le BOM (Byte Order Mark) UTF-8 qui empêche Brevo de reconnaître le HTML
+    // 2. Supprimer les caractères invisibles
+    // 3. Compacter le HTML
+    const cleanHtml = emailHtml
+      .replace(/^\uFEFF/, '')       // Supprimer BOM UTF-8 au début
+      .replace(/\uFEFF/g, '')       // Supprimer tous les BOM
+      .replace(/[\u200B-\u200D\uFEFF]/g, '') // Supprimer zero-width spaces
       .replace(/\n/g, '')           // Supprimer tous les retours à la ligne
       .replace(/\r/g, '')           // Supprimer les retours chariot
       .replace(/\t/g, '')           // Supprimer les tabulations
@@ -1521,7 +1526,7 @@ app.post('/api/send-email', async (req, res) => {
       },
       to: [{ email: to }],
       subject: subject.substring(0, 200),
-      htmlContent: compactHtml
+      htmlContent: cleanHtml
     };
     
     // Ajouter une pièce jointe si présente
@@ -1535,8 +1540,8 @@ app.post('/api/send-email', async (req, res) => {
     console.log('=== ENVOI EMAIL BREVO ===');
     console.log('To:', to);
     console.log('Subject:', subject);
-    console.log('HTML original length:', emailHtml.length);
-    console.log('HTML compact length:', compactHtml.length);
+    console.log('HTML starts with:', cleanHtml.substring(0, 50));
+    console.log('HTML length:', cleanHtml.length);
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
