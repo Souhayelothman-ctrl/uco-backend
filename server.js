@@ -1632,26 +1632,34 @@ app.post('/api/send-email', async (req, res) => {
 // ===== SMS (Brevo) =====
 app.post('/api/send-sms', async (req, res) => {
   try {
-    const { to, message } = sanitizeObject(req.body);
+    const { to, message, content } = req.body; // Accepter 'content' comme alias
+    const smsMessage = message || content;
     
-    if (!to || !message) {
-      return res.status(400).json({ success: false, error: 'Paramètres manquants' });
+    console.log('=== ENVOI SMS ===');
+    console.log('To (raw):', to);
+    console.log('Message:', smsMessage?.substring(0, 50));
+    
+    if (!to || !smsMessage) {
+      console.log('Erreur: Paramètres manquants');
+      return res.status(400).json({ success: false, error: 'Paramètres manquants (to ou message)' });
     }
     
     const settings = await getSettings();
     
     if (!settings.brevoApiKey) {
-      return res.status(503).json({ success: false, error: 'Service SMS non configuré' });
+      console.log('Erreur: Clé API Brevo non configurée');
+      return res.status(503).json({ success: false, error: 'Clé API Brevo non configurée' });
     }
     
     if (!settings.smsEnabled) {
-      return res.status(503).json({ success: false, error: 'SMS désactivé' });
+      console.log('Erreur: SMS désactivé dans les paramètres');
+      return res.status(503).json({ success: false, error: 'SMS désactivé. Activez-le dans Paramètres.' });
     }
     
     let phoneNumber = typeof to === 'object' ? to.number : to;
     let countryCode = typeof to === 'object' ? to.countryCode : 'FR';
     
-    phoneNumber = phoneNumber.replace(/[\s\.\-]/g, '');
+    phoneNumber = String(phoneNumber).replace(/[\s\.\-]/g, '');
     
     const prefixes = { 'FR': '+33', 'BE': '+32', 'CH': '+41', 'LU': '+352' };
     const prefix = prefixes[countryCode] || '+33';
@@ -1660,6 +1668,16 @@ app.post('/api/send-sms', async (req, res) => {
       phoneNumber = phoneNumber.startsWith('0') ? prefix + phoneNumber.slice(1) : prefix + phoneNumber;
     }
     
+    console.log('Numéro formaté:', phoneNumber);
+    
+    const smsPayload = {
+      sender: 'UCOANDCO',
+      recipient: phoneNumber,
+      content: smsMessage.slice(0, 160)
+    };
+    
+    console.log('Payload SMS:', JSON.stringify(smsPayload));
+    
     const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
       method: 'POST',
       headers: {
@@ -1667,22 +1685,22 @@ app.post('/api/send-sms', async (req, res) => {
         'api-key': settings.brevoApiKey,
         'content-type': 'application/json'
       },
-      body: JSON.stringify({
-        sender: 'UCOANDCO',
-        recipient: phoneNumber,
-        content: message.slice(0, 160) // Limiter à 160 caractères
-      })
+      body: JSON.stringify(smsPayload)
     });
     
+    const responseData = await response.json();
+    console.log('Réponse Brevo SMS:', JSON.stringify(responseData));
+    
     if (response.ok) {
-      res.json({ success: true });
+      console.log('SMS envoyé avec succès');
+      res.json({ success: true, messageId: responseData.messageId });
     } else {
-      const error = await response.json();
-      res.status(502).json({ success: false, error: error.message || 'Erreur SMS' });
+      console.log('Erreur Brevo SMS:', responseData);
+      res.status(502).json({ success: false, error: responseData.message || 'Erreur SMS Brevo', details: responseData });
     }
   } catch (error) {
     console.error('Erreur SMS:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
+    res.status(500).json({ success: false, error: 'Erreur serveur: ' + error.message });
   }
 });
 
