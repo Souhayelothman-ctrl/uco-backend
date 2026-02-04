@@ -691,6 +691,60 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Endpoint de test email - envoie un email HTML simple pour vérifier que Brevo fonctionne
+app.post('/api/test-email', async (req, res) => {
+  try {
+    const { to } = req.body;
+    
+    if (!to) {
+      return res.status(400).json({ success: false, error: 'Email destinataire requis' });
+    }
+    
+    const settings = await getSettings();
+    const apiKey = settings.brevoApiKey;
+    
+    if (!apiKey) {
+      return res.status(503).json({ success: false, error: 'Clé API Brevo non configurée' });
+    }
+    
+    // HTML très simple - exactement comme le test curl qui fonctionnait
+    const simpleHtml = '<html><head><meta charset="UTF-8"></head><body><h1 style="color:green;">Test UCO AND CO</h1><p>Si ce texte est <strong>vert</strong>, le HTML fonctionne correctement!</p><p>Date: ' + new Date().toLocaleString('fr-FR') + '</p></body></html>';
+    
+    console.log('=== TEST EMAIL ===');
+    console.log('To:', to);
+    console.log('HTML:', simpleHtml);
+    
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' },
+        to: [{ email: to }],
+        subject: 'Test HTML UCO AND CO',
+        htmlContent: simpleHtml
+      })
+    });
+    
+    const responseData = await response.json();
+    console.log('Brevo response:', responseData);
+    
+    if (response.ok) {
+      res.json({ success: true, messageId: responseData.messageId });
+    } else {
+      res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo', details: responseData });
+    }
+  } catch (error) {
+    console.error('Erreur test email:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+  });
+});
+
 // ===== AUTHENTIFICATION SÉCURISÉE =====
 app.post('/api/auth/admin', async (req, res) => {
   try {
