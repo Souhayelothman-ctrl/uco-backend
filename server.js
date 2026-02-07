@@ -178,7 +178,8 @@ const COLLECTIONS = {
   AUDIT_LOGS: 'auditLogs',
   SESSIONS: 'sessions',
   DOCUMENTS: 'documents',
-  CAMPAIGNS: 'campaigns'
+  CAMPAIGNS: 'campaigns',
+  AVIS: 'avis'
 };
 
 // Cache avec TTL
@@ -1784,6 +1785,60 @@ app.use((err, req, res, next) => {
   }
   
   res.status(500).json({ success: false, error: 'Erreur serveur interne' });
+});
+
+// ===== AVIS CLIENTS =====
+app.get('/api/avis', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const avis = await db.collection(COLLECTIONS.AVIS).find({}).sort({ dateCreation: -1 }).toArray();
+    res.json(avis || []);
+  } catch (error) {
+    console.error('Erreur récupération avis:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/avis', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const avisData = sanitizeObject(req.body);
+    
+    if (!avisData.id) {
+      avisData.id = 'avis_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    }
+    
+    avisData.dateCreation = avisData.dateCreation || new Date().toISOString();
+    
+    await db.collection(COLLECTIONS.AVIS).insertOne({
+      ...avisData,
+      _id: avisData.id
+    });
+    
+    console.log('Nouvel avis enregistré:', avisData.id);
+    res.status(201).json({ success: true, id: avisData.id });
+  } catch (error) {
+    console.error('Erreur création avis:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const { id } = req.params;
+    await db.collection(COLLECTIONS.AVIS).deleteOne({ id: sanitizeInput(id) });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erreur suppression avis:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
 });
 
 // Route 404
