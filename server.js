@@ -917,11 +917,22 @@ app.post('/api/auth/restaurant', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
     
+    console.log('=== AUTH RESTAURANT ===');
+    console.log('Email:', email);
+    
     if (!email || !password) {
       return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     }
     
     const restaurant = await getRestaurantByEmail(email);
+    
+    console.log('Restaurant trouvé:', restaurant ? 'Oui' : 'Non');
+    if (restaurant) {
+      console.log('- ID:', restaurant.id);
+      console.log('- Status:', restaurant.status);
+      console.log('- Has password:', !!restaurant.password);
+      console.log('- Has tempPassword:', !!restaurant.tempPassword);
+    }
     
     if (!restaurant) {
       return res.status(401).json({ success: false, error: 'Compte non trouvé' });
@@ -945,13 +956,19 @@ app.post('/api/auth/restaurant', async (req, res) => {
     
     // D'abord vérifier le mot de passe hashé (si existe)
     if (restaurant.password) {
-      isValid = await bcrypt.compare(password, restaurant.password);
+      try {
+        isValid = await bcrypt.compare(password, restaurant.password);
+        console.log('Vérification mot de passe hashé:', isValid);
+      } catch (bcryptError) {
+        console.error('Erreur bcrypt:', bcryptError);
+      }
     }
     
     // Si pas valide et qu'il y a un mot de passe provisoire, le vérifier
     if (!isValid && restaurant.tempPassword) {
       isValid = (password === restaurant.tempPassword);
       usedTempPassword = isValid;
+      console.log('Vérification mot de passe provisoire:', isValid);
     }
     
     if (!isValid) {
@@ -965,6 +982,8 @@ app.post('/api/auth/restaurant', async (req, res) => {
     const { password: _, tempPassword: __, loginAttempts, lockUntil, ...data } = restaurant;
     
     await auditLog('RESTAURANT_LOGIN_SUCCESS', email, { usedTempPassword }, req);
+    
+    console.log('Connexion réussie pour:', email);
     
     // Indiquer si le mot de passe provisoire a été utilisé (pour inciter à le changer)
     res.json({ 
