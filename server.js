@@ -935,15 +935,24 @@ app.post('/api/auth/restaurant', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Compte non approuvé' });
     }
     
-    if (!restaurant.password) {
-      return res.status(401).json({ success: false, error: 'Mot de passe non configuré' });
-    }
-    
     if (isAccountLocked(restaurant)) {
       return res.status(423).json({ success: false, error: 'Compte verrouillé' });
     }
     
-    const isValid = await bcrypt.compare(password, restaurant.password);
+    // Vérifier le mot de passe (hashé OU provisoire)
+    let isValid = false;
+    let usedTempPassword = false;
+    
+    // D'abord vérifier le mot de passe hashé (si existe)
+    if (restaurant.password) {
+      isValid = await bcrypt.compare(password, restaurant.password);
+    }
+    
+    // Si pas valide et qu'il y a un mot de passe provisoire, le vérifier
+    if (!isValid && restaurant.tempPassword) {
+      isValid = (password === restaurant.tempPassword);
+      usedTempPassword = isValid;
+    }
     
     if (!isValid) {
       await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
@@ -953,11 +962,17 @@ app.post('/api/auth/restaurant', async (req, res) => {
     await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
     
     const token = generateToken({ role: 'restaurant', email, id: restaurant.id });
-    const { password: _, loginAttempts, lockUntil, ...data } = restaurant;
+    const { password: _, tempPassword: __, loginAttempts, lockUntil, ...data } = restaurant;
     
-    await auditLog('RESTAURANT_LOGIN_SUCCESS', email, {}, req);
+    await auditLog('RESTAURANT_LOGIN_SUCCESS', email, { usedTempPassword }, req);
     
-    res.json({ success: true, role: 'restaurant', data, token });
+    // Indiquer si le mot de passe provisoire a été utilisé (pour inciter à le changer)
+    res.json({ 
+      success: true, 
+      role: 'restaurant', 
+      data: { ...data, usedTempPassword, needsContractSignature: !restaurant.contratStatus || restaurant.contratStatus !== 'signed' }, 
+      token 
+    });
   } catch (error) {
     console.error('Erreur auth restaurant:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
