@@ -1535,11 +1535,9 @@ app.put('/api/admin/password', async (req, res) => {
 // ===== EMAIL (Brevo) =====
 app.post('/api/send-email', async (req, res) => {
   try {
-    const { to, subject, htmlContent, html, senderName, attachment } = req.body;
+    const { to, subject, htmlContent, html, senderName, attachment, content, title } = req.body;
     
-    const rawHtml = htmlContent || html;
-    
-    if (!to || !subject || !rawHtml) {
+    if (!to || !subject) {
       return res.status(400).json({ success: false, error: 'Paramètres manquants' });
     }
     
@@ -1555,22 +1553,28 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
-    // TOUJOURS reconstruire le HTML côté serveur
-    // Nettoyer le contenu : supprimer toutes les balises html/head/body/doctype
-    let content = rawHtml
+    // Récupérer le contenu brut
+    let rawContent = content || htmlContent || html || '';
+    
+    // Supprimer TOUTES les balises structurelles HTML
+    let cleanContent = rawContent
       .replace(/<!DOCTYPE[^>]*>/gi, '')
-      .replace(/<\/?html[^>]*>/gi, '')
-      .replace(/<head[\s\S]*?<\/head>/gi, '')
-      .replace(/<\/?body[^>]*>/gi, '')
+      .replace(/<html[^>]*>/gi, '')
+      .replace(/<\/html>/gi, '')
+      .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
+      .replace(/<body[^>]*>/gi, '')
+      .replace(/<\/body>/gi, '')
       .replace(/<meta[^>]*>/gi, '')
-      .replace(/[\r\n\t]/g, '')
-      .replace(/\s{2,}/g, ' ')
       .trim();
     
-    // Reconstruire un HTML propre (comme le test qui fonctionne)
-    const finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:20px;font-family:Arial,sans-serif;">' + content + '</body></html>';
+    // Construire le HTML EXACTEMENT comme le test qui fonctionne
+    const finalHtml = '<html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;padding:20px;">' + cleanContent + '</body></html>';
     
-    // Construire le payload pour Brevo
+    console.log('=== ENVOI EMAIL ===');
+    console.log('To:', to);
+    console.log('Subject:', subject);
+    console.log('Final HTML (100 premiers chars):', finalHtml.substring(0, 100));
+    
     const emailPayload = {
       sender: { 
         name: senderName || 'UCO AND CO', 
@@ -1581,19 +1585,12 @@ app.post('/api/send-email', async (req, res) => {
       htmlContent: finalHtml
     };
     
-    // Ajouter une pièce jointe si présente
     if (attachment && attachment.content && attachment.name) {
       emailPayload.attachment = [{ 
         content: attachment.content, 
         name: attachment.name.substring(0, 100) 
       }];
     }
-    
-    console.log('=== ENVOI EMAIL BREVO ===');
-    console.log('To:', to);
-    console.log('Subject:', subject);
-    console.log('HTML starts with:', finalHtml.substring(0, 80));
-    console.log('HTML length:', finalHtml.length);
     
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -1608,7 +1605,7 @@ app.post('/api/send-email', async (req, res) => {
     const responseData = await response.json();
     
     if (response.ok) {
-      console.log('Email envoyé avec succès, messageId:', responseData.messageId);
+      console.log('Email OK, messageId:', responseData.messageId);
       res.json({ success: true, messageId: responseData.messageId });
     } else {
       console.error('Erreur Brevo:', responseData);
