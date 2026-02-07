@@ -1556,6 +1556,15 @@ app.post('/api/send-email', async (req, res) => {
     // Récupérer le contenu brut
     let rawContent = content || htmlContent || html || '';
     
+    // Décoder les entités HTML (le problème!)
+    rawContent = rawContent
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, ' ');
+    
     // Supprimer TOUTES les balises structurelles HTML
     let cleanContent = rawContent
       .replace(/<!DOCTYPE[^>]*>/gi, '')
@@ -1573,7 +1582,7 @@ app.post('/api/send-email', async (req, res) => {
     console.log('=== ENVOI EMAIL ===');
     console.log('To:', to);
     console.log('Subject:', subject);
-    console.log('Final HTML (100 premiers chars):', finalHtml.substring(0, 100));
+    console.log('Final HTML (150 chars):', finalHtml.substring(0, 150));
     
     const emailPayload = {
       sender: { 
