@@ -1537,7 +1537,6 @@ app.post('/api/send-email', async (req, res) => {
   try {
     const { to, subject, htmlContent, html, senderName, attachment } = req.body;
     
-    // Récupérer le HTML brut du frontend
     const rawHtml = htmlContent || html;
     
     if (!to || !subject || !rawHtml) {
@@ -1556,21 +1555,20 @@ app.post('/api/send-email', async (req, res) => {
       return res.status(503).json({ success: false, error: 'Service email non configuré' });
     }
     
-    // SOLUTION : Extraire le contenu du body et reconstruire le HTML côté serveur
-    // Le problème vient du transit frontend→backend qui corrompt le HTML
-    let finalHtml;
+    // TOUJOURS reconstruire le HTML côté serveur
+    // Nettoyer le contenu : supprimer toutes les balises html/head/body/doctype
+    let content = rawHtml
+      .replace(/<!DOCTYPE[^>]*>/gi, '')
+      .replace(/<\/?html[^>]*>/gi, '')
+      .replace(/<head[\s\S]*?<\/head>/gi, '')
+      .replace(/<\/?body[^>]*>/gi, '')
+      .replace(/<meta[^>]*>/gi, '')
+      .replace(/[\r\n\t]/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
     
-    // Extraire le contenu entre <body...> et </body>
-    const bodyMatch = rawHtml.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-    if (bodyMatch) {
-      // Reconstruire un HTML propre côté serveur (comme le test qui fonctionne)
-      const bodyContent = bodyMatch[1].replace(/[\r\n\t]/g, '').replace(/\s{2,}/g, ' ').trim();
-      finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;font-family:Arial,sans-serif;">' + bodyContent + '</body></html>';
-    } else {
-      // Pas de balise body trouvée, utiliser le contenu tel quel enveloppé dans un HTML simple
-      const content = rawHtml.replace(/<\/?html[^>]*>|<\/?head[^>]*>|<\/?body[^>]*>|<!DOCTYPE[^>]*>|<meta[^>]*>/gi, '').replace(/[\r\n\t]/g, '').replace(/\s{2,}/g, ' ').trim();
-      finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;font-family:Arial,sans-serif;">' + content + '</body></html>';
-    }
+    // Reconstruire un HTML propre (comme le test qui fonctionne)
+    const finalHtml = '<html><head><meta charset="UTF-8"></head><body style="margin:0;padding:20px;font-family:Arial,sans-serif;">' + content + '</body></html>';
     
     // Construire le payload pour Brevo
     const emailPayload = {
