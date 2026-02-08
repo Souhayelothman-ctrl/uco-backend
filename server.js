@@ -933,6 +933,7 @@ app.post('/api/auth/restaurant', async (req, res) => {
       console.log('- Status:', restaurant.status);
       console.log('- Has password:', !!restaurant.password);
       console.log('- Has tempPassword:', !!restaurant.tempPassword);
+      console.log('- CreatedBy:', restaurant.createdBy);
     }
     
     if (!restaurant) {
@@ -943,7 +944,16 @@ app.post('/api/auth/restaurant', async (req, res) => {
       return res.json({ success: false, error: 'pending' });
     }
     
-    if (restaurant.status !== 'approved') {
+    if (restaurant.status === 'terminated') {
+      return res.status(401).json({ success: false, error: 'Contrat résilié' });
+    }
+    
+    // Si le restaurant a été créé par l'admin (a un tempPassword) mais pas de status, on le considère comme approved
+    const isApproved = restaurant.status === 'approved' || 
+                       (restaurant.tempPassword && !restaurant.status) ||
+                       (restaurant.createdBy === 'admin' && !restaurant.status);
+    
+    if (!isApproved) {
       return res.status(401).json({ success: false, error: 'Compte non approuvé' });
     }
     
@@ -975,6 +985,12 @@ app.post('/api/auth/restaurant', async (req, res) => {
     if (!isValid) {
       await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
       return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+    }
+    
+    // Si le restaurant n'avait pas de status, le mettre à jour
+    if (!restaurant.status && (restaurant.tempPassword || restaurant.createdBy === 'admin')) {
+      await updateRestaurant(restaurant.id, { status: 'approved' });
+      console.log('Status mis à jour vers approved pour:', restaurant.id);
     }
     
     await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
