@@ -1465,6 +1465,57 @@ app.put('/api/restaurants/:id/password', async (req, res) => {
   }
 });
 
+// Endpoint pour changer le mot de passe avec vérification de l'ancien
+app.post('/api/restaurants/:id/change-password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { oldPassword, newPassword } = sanitizeObject(req.body);
+    
+    if (!oldPassword) {
+      return res.status(400).json({ success: false, error: 'Ancien mot de passe requis' });
+    }
+    
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ success: false, error: 'Nouveau mot de passe invalide (min 6 caractères)' });
+    }
+    
+    const restaurant = await getRestaurantById(id);
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    // Vérifier l'ancien mot de passe (hashé ou provisoire)
+    let isOldPasswordValid = false;
+    
+    if (restaurant.password) {
+      isOldPasswordValid = await bcrypt.compare(oldPassword, restaurant.password);
+    }
+    
+    if (!isOldPasswordValid && restaurant.tempPassword) {
+      isOldPasswordValid = (oldPassword === restaurant.tempPassword);
+    }
+    
+    if (!isOldPasswordValid) {
+      return res.status(401).json({ success: false, error: 'Ancien mot de passe incorrect' });
+    }
+    
+    // Mettre à jour le mot de passe et supprimer le tempPassword
+    await updateRestaurant(id, { 
+      password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS),
+      tempPassword: null, // Supprimer le mot de passe provisoire
+      passwordChangedAt: new Date().toISOString()
+    });
+    
+    await auditLog('RESTAURANT_PASSWORD_CHANGED', id, { method: 'user_change' }, req);
+    
+    console.log('Mot de passe changé pour restaurant:', id);
+    res.json({ success: true, message: 'Mot de passe modifié avec succès' });
+  } catch (error) {
+    console.error('Erreur changement mot de passe:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // ===== COLLECTES =====
 app.get('/api/collections', async (req, res) => {
   const collections = await getCollections();
