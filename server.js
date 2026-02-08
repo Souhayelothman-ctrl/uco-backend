@@ -207,25 +207,32 @@ function isStrongPassword(password) {
 }
 
 // Sanitization des entrées
-function sanitizeInput(input) {
+function sanitizeInput(input, key = '') {
   if (typeof input !== 'string') return input;
-  return input
+  
+  // Ne pas limiter la longueur pour les champs base64, signatures, contrat, etc.
+  const unlimitedFields = ['restaurant', 'admin', 'collecteur', 'base64', 'content', 'data', 'signature'];
+  const isUnlimited = unlimitedFields.some(f => key.toLowerCase().includes(f));
+  
+  const sanitized = input
     .replace(/[<>]/g, '') // Enlever les balises HTML
-    .trim()
-    .slice(0, 1000); // Limiter la longueur
+    .trim();
+  
+  // Limiter la longueur seulement pour les champs normaux
+  return isUnlimited ? sanitized : sanitized.slice(0, 5000);
 }
 
 // Sanitization récursive d'un objet
-function sanitizeObject(obj) {
+function sanitizeObject(obj, parentKey = '') {
   if (typeof obj !== 'object' || obj === null) {
-    return sanitizeInput(obj);
+    return sanitizeInput(obj, parentKey);
   }
   
   const sanitized = Array.isArray(obj) ? [] : {};
   for (const key of Object.keys(obj)) {
     // Bloquer les clés commençant par $ (opérateurs MongoDB)
     if (key.startsWith('$')) continue;
-    sanitized[key] = sanitizeObject(obj[key]);
+    sanitized[key] = sanitizeObject(obj[key], key);
   }
   return sanitized;
 }
