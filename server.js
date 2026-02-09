@@ -1942,6 +1942,221 @@ app.delete('/api/partners/:id', async (req, res) => {
   }
 });
 
+// ===== STRIPE - PAIEMENTS ABONNEMENTS =====
+
+// Créer une session de paiement Stripe
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  try {
+    const { restaurantId, plan, email, enseigne } = req.body;
+    
+    // Récupérer la clé Stripe depuis les settings
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    // Prix selon le plan
+    const prices = {
+      essentiel: 1990, // 19.90€ en centimes
+      pro: 2990 // 29.90€ en centimes
+    };
+    
+    const planNames = {
+      essentiel: 'UCO Essentiel',
+      pro: 'UCO Pro'
+    };
+    
+    // Créer ou récupérer le client Stripe
+    let customer;
+    const existingCustomers = await stripe.customers.list({ email, limit: 1 });
+    if (existingCustomers.data.length > 0) {
+      customer = existingCustomers.data[0];
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        name: enseigne,
+        metadata: { restaurantId }
+      });
+    }
+    
+    // Créer la session de checkout
+    const session = await stripe.checkout.sessions.create({
+      customer: customer.id,
+      payment_method_types: ['card', 'sepa_debit'],
+      mode: 'subscription',
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: `Abonnement ${planNames[plan]}`,
+            description: `Services partenaires UCO AND CO - ${planNames[plan]}`
+          },
+          unit_amount: prices[plan],
+          recurring: { interval: 'month' }
+        },
+        quantity: 1
+      }],
+      success_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=cancelled`,
+      metadata: {
+        restaurantId,
+        plan
+      }
+    });
+    
+    console.log('✅ Session Stripe créée:', session.id);
+    res.json({ success: true, sessionId: session.id, url: session.url });
+    
+  } catch (error) {
+    console.error('Erreur création session Stripe:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Webhook Stripe pour les événements de paiement
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) {
+      return res.status(400).json({ error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    const sig = req.headers['stripe-signature'];
+    
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, settings.stripeWebhookSecret);
+    } catch (err) {
+      console.error('Erreur signature webhook:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    // Gérer les événements
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const { restaurantId, plan } = session.metadata;
+        
+        // Mettre à jour l'abonnement du restaurant
+        await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+          {
+            $set: {
+              subscription: {
+                plan,
+                status: 'active',
+                stripeCustomerId: session.customer,
+                stripeSubscriptionId: session.subscription,
+                startDate: new Date().toISOString(),
+                lastPaymentDate: new Date().toISOString()
+              }
+            }
+          }
+        );
+        console.log('✅ Abonnement activé pour:', restaurantId);
+        break;
+      }
+      
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        // Mettre à jour la date du dernier paiement
+        if (invoice.subscription) {
+          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+            { 'subscription.stripeSubscriptionId': invoice.subscription },
+            { $set: { 'subscription.lastPaymentDate': new Date().toISOString() } }
+          );
+          console.log('✅ Paiement reçu pour subscription:', invoice.subscription);
+        }
+        break;
+      }
+      
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        // Marquer l'abonnement comme en échec de paiement
+        if (invoice.subscription) {
+          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+            { 'subscription.stripeSubscriptionId': invoice.subscription },
+            { $set: { 'subscription.status': 'payment_failed' } }
+          );
+          console.log('⚠️ Échec paiement pour subscription:', invoice.subscription);
+        }
+        break;
+      }
+      
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+        // Désactiver l'abonnement
+        await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          { 'subscription.stripeSubscriptionId': subscription.id },
+          { $set: { 'subscription.status': 'cancelled', 'subscription.endDate': new Date().toISOString() } }
+        );
+        console.log('❌ Abonnement annulé:', subscription.id);
+        break;
+      }
+    }
+    
+    res.json({ received: true });
+    
+  } catch (error) {
+    console.error('Erreur webhook Stripe:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Annuler un abonnement Stripe
+app.post('/api/stripe/cancel-subscription', async (req, res) => {
+  try {
+    const { subscriptionId } = req.body;
+    
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    // Annuler à la fin de la période en cours
+    const subscription = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true
+    });
+    
+    console.log('✅ Abonnement marqué pour annulation:', subscriptionId);
+    res.json({ success: true, subscription });
+    
+  } catch (error) {
+    console.error('Erreur annulation abonnement:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Récupérer le portail client Stripe
+app.post('/api/stripe/customer-portal', async (req, res) => {
+  try {
+    const { customerId } = req.body;
+    
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${req.headers.origin || 'https://uco-and-co.fr'}`
+    });
+    
+    res.json({ success: true, url: session.url });
+    
+  } catch (error) {
+    console.error('Erreur portail client:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ===== AVIS CLIENTS =====
 app.get('/api/avis', async (req, res) => {
   try {
