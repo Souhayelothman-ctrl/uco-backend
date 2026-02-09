@@ -211,7 +211,7 @@ function sanitizeInput(input, key = '') {
   if (typeof input !== 'string') return input;
   
   // Ne pas limiter la longueur pour les champs base64, signatures, contrat, etc.
-  const unlimitedFields = ['restaurant', 'admin', 'collecteur', 'base64', 'content', 'data', 'signature'];
+  const unlimitedFields = ['restaurant', 'admin', 'collecteur', 'base64', 'content', 'data', 'signature', 'contrat', 'bordereau'];
   const isUnlimited = unlimitedFields.some(f => key.toLowerCase().includes(f));
   
   const sanitized = input
@@ -1859,6 +1859,87 @@ app.use((err, req, res, next) => {
   }
   
   res.status(500).json({ success: false, error: 'Erreur serveur interne' });
+});
+
+// ===== PARTENAIRES PRESTATAIRES =====
+app.get('/api/partners', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const partners = await db.collection('partners').find({}).toArray();
+    res.json(partners);
+  } catch (error) {
+    console.error('Erreur GET partners:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/partners', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const partner = req.body;
+    if (!partner.id) {
+      partner.id = 'partner_' + Date.now();
+    }
+    partner.createdAt = new Date().toISOString();
+    
+    await db.collection('partners').insertOne(partner);
+    console.log('✅ Nouveau partenaire créé:', partner.name);
+    res.json({ success: true, partner });
+  } catch (error) {
+    console.error('Erreur POST partner:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/partners/:id', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const { id } = req.params;
+    const updates = req.body;
+    updates.updatedAt = new Date().toISOString();
+    
+    const result = await db.collection('partners').updateOne(
+      { id: id },
+      { $set: updates }
+    );
+    
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
+    }
+    
+    console.log('✅ Partenaire mis à jour:', id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erreur PUT partner:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/partners/:id', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const { id } = req.params;
+    
+    const result = await db.collection('partners').deleteOne({ id: id });
+    
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
+    }
+    
+    console.log('✅ Partenaire supprimé:', id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erreur DELETE partner:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ===== AVIS CLIENTS =====
