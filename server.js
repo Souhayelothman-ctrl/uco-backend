@@ -540,7 +540,15 @@ async function getRestaurants(status = null) {
 
 async function getRestaurantById(id) {
   if (!db) return null;
-  return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ id: sanitizeInput(id) });
+  const sanitizedId = sanitizeInput(id);
+  // Chercher par id, siret ou qrCode
+  return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ 
+    $or: [
+      { id: sanitizedId },
+      { siret: sanitizedId },
+      { qrCode: sanitizedId }
+    ]
+  });
 }
 
 async function getRestaurantByQRCode(qrCode) {
@@ -568,8 +576,10 @@ async function addRestaurant(restaurant) {
 
 async function updateRestaurant(id, data) {
   if (!db) return false;
+  const sanitizedId = sanitizeInput(id);
+  // Chercher par id, siret ou qrCode
   await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-    { id: sanitizeInput(id) },
+    { $or: [{ id: sanitizedId }, { siret: sanitizedId }, { qrCode: sanitizedId }] },
     { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
   );
   return true;
