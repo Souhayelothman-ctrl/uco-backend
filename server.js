@@ -2286,11 +2286,6 @@ app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Route 404
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: 'Route non trouvée' });
-});
-
 // =============================================
 // INTÉGRATION QONTO - FACTURES AUTOMATIQUES
 // =============================================
@@ -2445,14 +2440,14 @@ async function attachInvoiceToQonto(invoicePDF, invoiceData) {
       return { success: false, error: 'Qonto non configuré' };
     }
     
-    const qontoAuth = Buffer.from(`${settings.qontoOrganizationId}:${settings.qontoSecretKey}`).toString('base64');
+    const qontoAuth = `${settings.qontoOrganizationId}:${settings.qontoSecretKey}`;
     
     // 1. Récupérer les transactions récentes pour trouver celle correspondante
     const transactionsResponse = await fetch(
       `https://thirdparty.qonto.com/v2/transactions?status=completed&side=credit`,
       {
         headers: {
-          'Authorization': `Basic ${qontoAuth}`,
+          'Authorization': qontoAuth,
           'Content-Type': 'application/json'
         }
       }
@@ -2504,7 +2499,7 @@ async function attachInvoiceToQonto(invoicePDF, invoiceData) {
       {
         method: 'POST',
         headers: {
-          'Authorization': `Basic ${qontoAuth}`,
+          'Authorization': qontoAuth,
           ...formData.getHeaders()
         },
         body: formData
@@ -2535,8 +2530,8 @@ async function attachInvoiceToQonto(invoicePDF, invoiceData) {
   }
 }
 
-// Endpoint pour configurer Qonto
-app.post('/api/qonto/configure', authenticateToken, async (req, res) => {
+// Endpoint pour configurer Qonto (sans auth car vérifié par Qonto directement)
+app.post('/api/qonto/configure', async (req, res) => {
   try {
     const { organizationId, secretKey } = req.body;
     
@@ -2545,10 +2540,10 @@ app.post('/api/qonto/configure', authenticateToken, async (req, res) => {
     }
     
     // Tester la connexion
-    const qontoAuth = Buffer.from(`${organizationId}:${secretKey}`).toString('base64');
+    const qontoAuth = `${organizationId}:${secretKey}`;
     const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
       headers: {
-        'Authorization': `Basic ${qontoAuth}`,
+        'Authorization': qontoAuth,
         'Content-Type': 'application/json'
       }
     });
@@ -2702,7 +2697,7 @@ app.post('/api/qonto/retry-pending', authenticateToken, async (req, res) => {
 });
 
 // Statut de l'intégration Qonto
-app.get('/api/qonto/status', authenticateToken, async (req, res) => {
+app.get('/api/qonto/status', async (req, res) => {
   try {
     const settings = await db.collection('settings').findOne({});
     
@@ -2714,10 +2709,10 @@ app.get('/api/qonto/status', authenticateToken, async (req, res) => {
     }
     
     // Tester la connexion
-    const qontoAuth = Buffer.from(`${settings.qontoOrganizationId}:${settings.qontoSecretKey}`).toString('base64');
+    const qontoAuth = `${settings.qontoOrganizationId}:${settings.qontoSecretKey}`;
     const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
       headers: {
-        'Authorization': `Basic ${qontoAuth}`,
+        'Authorization': qontoAuth,
         'Content-Type': 'application/json'
       }
     });
@@ -2745,6 +2740,11 @@ app.get('/api/qonto/status', authenticateToken, async (req, res) => {
     console.error('Erreur statut Qonto:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// Route 404 - DOIT ÊTRE EN DERNIER
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Route non trouvée' });
 });
 
 // =============================================
