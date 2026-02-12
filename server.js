@@ -10,6 +10,8 @@ const xss = require('xss-clean');
 const hpp = require('hpp');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const PDFDocument = require('pdfkit');
+const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -2074,11 +2076,74 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const invoice = event.data.object;
         // Mettre à jour la date du dernier paiement
         if (invoice.subscription) {
-          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOneAndUpdate(
             { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { $set: { 'subscription.lastPaymentDate': new Date().toISOString() } }
+            { $set: { 'subscription.lastPaymentDate': new Date().toISOString() } },
+            { returnDocument: 'after' }
           );
-          console.log('✅ Paiement reçu pour subscription:', invoice.subscription);
+          
+          if (restaurant.value) {
+            console.log('✅ Paiement reçu pour subscription:', invoice.subscription);
+            
+            // Générer et attacher la facture à Qonto
+            try {
+              const PLANS = {
+                starter: { name: 'Starter', price: 0 },
+                simple: { name: 'Simple', price: 14.99 },
+                premium: { name: 'Premium', price: 19.99 }
+              };
+              
+              const r = restaurant.value;
+              const plan = PLANS[r.subscription?.plan];
+              const priceTTC = invoice.amount_paid / 100; // Stripe utilise les centimes
+              const priceHT = (priceTTC / 1.20).toFixed(2);
+              const tva = (priceTTC - parseFloat(priceHT)).toFixed(2);
+              
+              const invoiceNumber = `FAC-${new Date().getFullYear()}${String(new Date().getMonth()+1).padStart(2,'0')}-${String(Math.floor(Math.random()*10000)).padStart(5,'0')}`;
+              
+              const invoiceData = {
+                invoiceNumber,
+                date: new Date().toLocaleDateString('fr-FR'),
+                clientName: r.societe || r.enseigne,
+                clientAddress: r.adresse?.rue || '',
+                clientPostalCode: r.adresse?.codePostal || '',
+                clientCity: r.adresse?.ville || '',
+                clientSiret: r.siret === 'EN_COURS' ? 'En cours' : r.siret,
+                clientEmail: r.email,
+                planName: plan?.name || r.subscription?.plan,
+                priceHT,
+                tva,
+                priceTTC: priceTTC.toFixed(2),
+                cardLast4: r.subscription?.cardLast4 || '****',
+                restaurantId: r.siret || r.id
+              };
+              
+              // Générer le PDF
+              const invoicePDF = await generateInvoicePDF(invoiceData);
+              
+              // Sauvegarder la facture
+              await db.collection('invoices').insertOne({
+                ...invoiceData,
+                pdfBase64: invoicePDF.toString('base64'),
+                stripeInvoiceId: invoice.id,
+                createdAt: new Date()
+              });
+              
+              // Attacher à Qonto (asynchrone, ne bloque pas)
+              attachInvoiceToQonto(invoicePDF, invoiceData).then(result => {
+                if (result.success) {
+                  db.collection('invoices').updateOne(
+                    { invoiceNumber },
+                    { $set: { qontoAttached: true, qontoTransactionId: result.transactionId } }
+                  );
+                }
+              }).catch(err => console.error('Erreur Qonto async:', err));
+              
+              console.log('📄 Facture générée:', invoiceNumber);
+            } catch (invoiceError) {
+              console.error('Erreur génération facture:', invoiceError);
+            }
+          }
         }
         break;
       }
@@ -2224,6 +2289,462 @@ app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
 // Route 404
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Route non trouvée' });
+});
+
+// =============================================
+// INTÉGRATION QONTO - FACTURES AUTOMATIQUES
+// =============================================
+
+// Fonction pour générer une facture PDF
+async function generateInvoicePDF(invoiceData) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ margin: 50, size: 'A4' });
+      const chunks = [];
+      
+      doc.on('data', chunk => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+      
+      // Couleurs UCO AND CO
+      const vertPrincipal = '#6bb44a';
+      const vertFonce = '#2d5016';
+      
+      // En-tête
+      doc.fillColor(vertPrincipal)
+         .rect(0, 0, doc.page.width, 100)
+         .fill();
+      
+      doc.fillColor('white')
+         .fontSize(28)
+         .font('Helvetica-Bold')
+         .text('FACTURE', 50, 35);
+      
+      doc.fontSize(12)
+         .font('Helvetica')
+         .text(invoiceData.invoiceNumber, 50, 65);
+      
+      // Informations UCO AND CO
+      doc.fillColor('black')
+         .fontSize(10)
+         .font('Helvetica-Bold')
+         .text('UCO AND CO', 50, 120);
+      
+      doc.font('Helvetica')
+         .text('119 Route de la Varenne', 50, 135)
+         .text('28270 Rueil La Gadelière', 50, 148)
+         .text('SIRET: 953 315 041 00012', 50, 161)
+         .text('TVA: FR 953 315 041', 50, 174);
+      
+      // Informations facture (droite)
+      doc.font('Helvetica-Bold')
+         .text('Date:', 400, 120);
+      doc.font('Helvetica')
+         .text(invoiceData.date, 450, 120);
+      
+      doc.font('Helvetica-Bold')
+         .text('N° Facture:', 400, 135);
+      doc.font('Helvetica')
+         .text(invoiceData.invoiceNumber, 450, 135);
+      
+      // Client
+      doc.fillColor(vertPrincipal)
+         .rect(50, 210, 250, 20)
+         .fill();
+      
+      doc.fillColor('white')
+         .font('Helvetica-Bold')
+         .fontSize(10)
+         .text('FACTURÉ À', 55, 215);
+      
+      doc.fillColor('black')
+         .font('Helvetica-Bold')
+         .text(invoiceData.clientName, 50, 240);
+      
+      doc.font('Helvetica')
+         .text(invoiceData.clientAddress, 50, 255)
+         .text(`${invoiceData.clientPostalCode} ${invoiceData.clientCity}`, 50, 268)
+         .text(`SIRET: ${invoiceData.clientSiret}`, 50, 281)
+         .text(`Email: ${invoiceData.clientEmail}`, 50, 294);
+      
+      // Tableau des articles
+      const tableTop = 340;
+      
+      // En-tête du tableau
+      doc.fillColor(vertPrincipal)
+         .rect(50, tableTop, 495, 25)
+         .fill();
+      
+      doc.fillColor('white')
+         .font('Helvetica-Bold')
+         .fontSize(10)
+         .text('Description', 55, tableTop + 8)
+         .text('Prix HT', 380, tableTop + 8)
+         .text('TVA', 430, tableTop + 8)
+         .text('Total TTC', 480, tableTop + 8);
+      
+      // Ligne de l'article
+      const itemY = tableTop + 35;
+      doc.fillColor('black')
+         .font('Helvetica')
+         .text(`Abonnement mensuel ${invoiceData.planName}`, 55, itemY)
+         .text(`${invoiceData.priceHT}€`, 380, itemY)
+         .text(`${invoiceData.tva}€`, 430, itemY)
+         .text(`${invoiceData.priceTTC}€`, 480, itemY);
+      
+      // Ligne de séparation
+      doc.moveTo(50, itemY + 20).lineTo(545, itemY + 20).stroke('#ddd');
+      
+      // Totaux
+      const totalsY = itemY + 40;
+      doc.font('Helvetica')
+         .text('Sous-total HT:', 350, totalsY)
+         .text(`${invoiceData.priceHT}€`, 480, totalsY);
+      
+      doc.text('TVA (20%):', 350, totalsY + 18)
+         .text(`${invoiceData.tva}€`, 480, totalsY + 18);
+      
+      doc.fillColor(vertPrincipal)
+         .rect(340, totalsY + 38, 205, 25)
+         .fill();
+      
+      doc.fillColor('white')
+         .font('Helvetica-Bold')
+         .text('TOTAL TTC:', 350, totalsY + 45)
+         .text(`${invoiceData.priceTTC}€`, 480, totalsY + 45);
+      
+      // Informations de paiement
+      doc.fillColor('black')
+         .font('Helvetica')
+         .fontSize(9)
+         .text(`Paiement par carte bancaire **** **** **** ${invoiceData.cardLast4}`, 50, totalsY + 90);
+      
+      doc.text(`Date de paiement: ${invoiceData.date}`, 50, totalsY + 105);
+      
+      // Pied de page
+      const footerY = 720;
+      doc.fillColor('#666')
+         .fontSize(8)
+         .text('UCO AND CO - Collecte et valorisation des huiles alimentaires usagées', 50, footerY, { align: 'center', width: 495 })
+         .text('Tél: 06 10 25 10 63 | Email: contact@uco-and-co.com | www.uco-and-co.fr', 50, footerY + 12, { align: 'center', width: 495 });
+      
+      doc.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+// Fonction pour envoyer une facture à Qonto
+async function attachInvoiceToQonto(invoicePDF, invoiceData) {
+  try {
+    const settings = await db.collection('settings').findOne({});
+    
+    if (!settings?.qontoOrganizationId || !settings?.qontoSecretKey) {
+      console.log('⚠️ Qonto non configuré - facture non attachée');
+      return { success: false, error: 'Qonto non configuré' };
+    }
+    
+    const qontoAuth = Buffer.from(`${settings.qontoOrganizationId}:${settings.qontoSecretKey}`).toString('base64');
+    
+    // 1. Récupérer les transactions récentes pour trouver celle correspondante
+    const transactionsResponse = await fetch(
+      `https://thirdparty.qonto.com/v2/transactions?status=completed&side=credit`,
+      {
+        headers: {
+          'Authorization': `Basic ${qontoAuth}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    if (!transactionsResponse.ok) {
+      console.error('Erreur récupération transactions Qonto:', await transactionsResponse.text());
+      return { success: false, error: 'Erreur API Qonto' };
+    }
+    
+    const transactionsData = await transactionsResponse.json();
+    
+    // Chercher la transaction correspondante (montant et date proche)
+    const targetAmount = parseFloat(invoiceData.priceTTC);
+    const invoiceDate = new Date(invoiceData.date);
+    
+    const matchingTransaction = transactionsData.transactions?.find(t => {
+      const txAmount = Math.abs(t.amount);
+      const txDate = new Date(t.settled_at || t.emitted_at);
+      const timeDiff = Math.abs(txDate - invoiceDate);
+      const daysDiff = timeDiff / (1000 * 60 * 60 * 24);
+      
+      // Match si montant identique et moins de 2 jours d'écart
+      return Math.abs(txAmount - targetAmount) < 0.01 && daysDiff < 2;
+    });
+    
+    if (!matchingTransaction) {
+      console.log('⚠️ Transaction Qonto correspondante non trouvée');
+      // Stocker la facture pour retry plus tard
+      await db.collection('pending_qonto_invoices').insertOne({
+        invoiceData,
+        invoicePDF: invoicePDF.toString('base64'),
+        createdAt: new Date(),
+        status: 'pending'
+      });
+      return { success: false, error: 'Transaction non trouvée - mise en attente' };
+    }
+    
+    // 2. Uploader la facture comme pièce jointe
+    const FormData = require('form-data');
+    const formData = new FormData();
+    formData.append('file', invoicePDF, {
+      filename: `${invoiceData.invoiceNumber}.pdf`,
+      contentType: 'application/pdf'
+    });
+    
+    const attachmentResponse = await fetch(
+      `https://thirdparty.qonto.com/v2/transactions/${matchingTransaction.id}/attachments`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${qontoAuth}`,
+          ...formData.getHeaders()
+        },
+        body: formData
+      }
+    );
+    
+    if (!attachmentResponse.ok) {
+      console.error('Erreur upload facture Qonto:', await attachmentResponse.text());
+      return { success: false, error: 'Erreur upload facture' };
+    }
+    
+    console.log(`✅ Facture ${invoiceData.invoiceNumber} attachée à la transaction Qonto ${matchingTransaction.id}`);
+    
+    // Enregistrer dans la base
+    await db.collection('qonto_invoices').insertOne({
+      invoiceNumber: invoiceData.invoiceNumber,
+      transactionId: matchingTransaction.id,
+      restaurantId: invoiceData.restaurantId,
+      amount: invoiceData.priceTTC,
+      attachedAt: new Date()
+    });
+    
+    return { success: true, transactionId: matchingTransaction.id };
+    
+  } catch (error) {
+    console.error('Erreur intégration Qonto:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Endpoint pour configurer Qonto
+app.post('/api/qonto/configure', authenticateToken, async (req, res) => {
+  try {
+    const { organizationId, secretKey } = req.body;
+    
+    if (!organizationId || !secretKey) {
+      return res.status(400).json({ success: false, error: 'Organization ID et Secret Key requis' });
+    }
+    
+    // Tester la connexion
+    const qontoAuth = Buffer.from(`${organizationId}:${secretKey}`).toString('base64');
+    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
+      headers: {
+        'Authorization': `Basic ${qontoAuth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!testResponse.ok) {
+      return res.status(400).json({ success: false, error: 'Identifiants Qonto invalides' });
+    }
+    
+    const orgData = await testResponse.json();
+    
+    // Sauvegarder les identifiants
+    await db.collection('settings').updateOne(
+      {},
+      { 
+        $set: { 
+          qontoOrganizationId: organizationId, 
+          qontoSecretKey: secretKey,
+          qontoOrganizationName: orgData.organization?.name 
+        } 
+      },
+      { upsert: true }
+    );
+    
+    console.log('✅ Qonto configuré pour:', orgData.organization?.name);
+    res.json({ success: true, organizationName: orgData.organization?.name });
+    
+  } catch (error) {
+    console.error('Erreur configuration Qonto:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint pour générer et attacher une facture manuellement
+app.post('/api/invoices/generate', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, planId, amount, cardLast4 } = req.body;
+    
+    // Récupérer le restaurant
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const PLANS = {
+      starter: { name: 'Starter', price: 0 },
+      simple: { name: 'Simple', price: 14.99 },
+      premium: { name: 'Premium', price: 19.99 }
+    };
+    
+    const plan = PLANS[planId];
+    const priceTTC = amount || plan?.price || 0;
+    const priceHT = (priceTTC / 1.20).toFixed(2);
+    const tva = (priceTTC - parseFloat(priceHT)).toFixed(2);
+    
+    const invoiceNumber = `FAC-${new Date().getFullYear()}${String(new Date().getMonth()+1).padStart(2,'0')}-${String(Math.floor(Math.random()*10000)).padStart(5,'0')}`;
+    
+    const invoiceData = {
+      invoiceNumber,
+      date: new Date().toLocaleDateString('fr-FR'),
+      clientName: restaurant.societe || restaurant.enseigne,
+      clientAddress: restaurant.adresse?.rue || '',
+      clientPostalCode: restaurant.adresse?.codePostal || '',
+      clientCity: restaurant.adresse?.ville || '',
+      clientSiret: restaurant.siret === 'EN_COURS' ? 'En cours' : restaurant.siret,
+      clientEmail: restaurant.email,
+      planName: plan?.name || planId,
+      priceHT,
+      tva,
+      priceTTC: priceTTC.toFixed(2),
+      cardLast4: cardLast4 || '****',
+      restaurantId
+    };
+    
+    // Générer le PDF
+    const invoicePDF = await generateInvoicePDF(invoiceData);
+    
+    // Attacher à Qonto
+    const qontoResult = await attachInvoiceToQonto(invoicePDF, invoiceData);
+    
+    // Sauvegarder la facture dans la base
+    await db.collection('invoices').insertOne({
+      ...invoiceData,
+      pdfBase64: invoicePDF.toString('base64'),
+      qontoAttached: qontoResult.success,
+      qontoTransactionId: qontoResult.transactionId,
+      createdAt: new Date()
+    });
+    
+    res.json({ 
+      success: true, 
+      invoiceNumber,
+      qontoAttached: qontoResult.success,
+      pdfBase64: invoicePDF.toString('base64')
+    });
+    
+  } catch (error) {
+    console.error('Erreur génération facture:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint pour récupérer les factures d'un restaurant
+app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const invoices = await db.collection('invoices')
+      .find({ restaurantId: sanitizeInput(restaurantId) })
+      .sort({ createdAt: -1 })
+      .toArray();
+    
+    res.json({ success: true, invoices });
+  } catch (error) {
+    console.error('Erreur récupération factures:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Job pour réessayer les factures en attente (appelé périodiquement)
+app.post('/api/qonto/retry-pending', authenticateToken, async (req, res) => {
+  try {
+    const pendingInvoices = await db.collection('pending_qonto_invoices')
+      .find({ status: 'pending' })
+      .limit(10)
+      .toArray();
+    
+    const results = [];
+    
+    for (const pending of pendingInvoices) {
+      const invoicePDF = Buffer.from(pending.invoicePDF, 'base64');
+      const result = await attachInvoiceToQonto(invoicePDF, pending.invoiceData);
+      
+      if (result.success) {
+        await db.collection('pending_qonto_invoices').updateOne(
+          { _id: pending._id },
+          { $set: { status: 'attached', attachedAt: new Date() } }
+        );
+      }
+      
+      results.push({ invoiceNumber: pending.invoiceData.invoiceNumber, ...result });
+    }
+    
+    res.json({ success: true, processed: results.length, results });
+    
+  } catch (error) {
+    console.error('Erreur retry Qonto:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Statut de l'intégration Qonto
+app.get('/api/qonto/status', authenticateToken, async (req, res) => {
+  try {
+    const settings = await db.collection('settings').findOne({});
+    
+    if (!settings?.qontoOrganizationId) {
+      return res.json({ 
+        success: true, 
+        configured: false 
+      });
+    }
+    
+    // Tester la connexion
+    const qontoAuth = Buffer.from(`${settings.qontoOrganizationId}:${settings.qontoSecretKey}`).toString('base64');
+    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
+      headers: {
+        'Authorization': `Basic ${qontoAuth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const connected = testResponse.ok;
+    
+    // Stats
+    const totalInvoices = await db.collection('invoices').countDocuments();
+    const attachedInvoices = await db.collection('invoices').countDocuments({ qontoAttached: true });
+    const pendingInvoices = await db.collection('pending_qonto_invoices').countDocuments({ status: 'pending' });
+    
+    res.json({ 
+      success: true, 
+      configured: true,
+      connected,
+      organizationName: settings.qontoOrganizationName,
+      stats: {
+        totalInvoices,
+        attachedInvoices,
+        pendingInvoices
+      }
+    });
+    
+  } catch (error) {
+    console.error('Erreur statut Qonto:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // =============================================
