@@ -2113,17 +2113,16 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
   try {
     const { restaurantId, plan, email, enseigne, siret } = req.body;
     
+    console.log('📦 Création abonnement:', { restaurantId, plan, email, enseigne });
+    
     const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
+      console.log('❌ stripeSecretKey manquante dans settings');
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
     
+    console.log('✅ Clé Stripe trouvée');
     const stripe = require('stripe')(settings.stripeSecretKey);
-    
-    // Initialiser les prix si pas encore fait
-    if (!STRIPE_PLANS[plan]?.stripePriceId && plan !== 'starter') {
-      await initializeStripePrices(stripe);
-    }
     
     // Plan gratuit - pas besoin de Stripe
     if (plan === 'starter' || STRIPE_PLANS[plan]?.price === 0) {
@@ -2134,9 +2133,55 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
       });
     }
     
+    // Vérifier que le plan existe
+    if (!STRIPE_PLANS[plan]) {
+      console.log('❌ Plan inconnu:', plan);
+      return res.status(400).json({ success: false, error: `Plan inconnu: ${plan}` });
+    }
+    
+    // Initialiser les prix si pas encore fait
+    if (!STRIPE_PLANS[plan].stripePriceId) {
+      console.log('🔄 Initialisation des prix Stripe...');
+      await initializeStripePrices(stripe);
+    }
+    
+    // Revérifier après initialisation
     const planConfig = STRIPE_PLANS[plan];
+    console.log('📋 Config du plan:', { plan, stripePriceId: planConfig?.stripePriceId, price: planConfig?.price });
+    
     if (!planConfig?.stripePriceId) {
-      return res.status(400).json({ success: false, error: 'Plan invalide ou non configuré' });
+      // Tenter de créer le prix directement
+      console.log('⚠️ Prix non trouvé, création directe...');
+      try {
+        // Créer le produit
+        const product = await stripe.products.create({
+          name: `Abonnement UCO ${planConfig.name}`,
+          description: `Services partenaires UCO AND CO - Formule ${planConfig.name}`,
+          metadata: { planId: plan }
+        });
+        
+        // Créer le prix
+        const price = await stripe.prices.create({
+          product: product.id,
+          unit_amount: planConfig.price,
+          currency: 'eur',
+          recurring: { interval: 'month' },
+          metadata: { planId: plan }
+        });
+        
+        STRIPE_PLANS[plan].stripePriceId = price.id;
+        STRIPE_PLANS[plan].stripeProductId = product.id;
+        console.log('✅ Prix créé directement:', price.id);
+      } catch (createError) {
+        console.error('❌ Erreur création prix:', createError.message);
+        return res.status(400).json({ success: false, error: 'Erreur création prix Stripe: ' + createError.message });
+      }
+    }
+    
+    // Vérification finale
+    if (!STRIPE_PLANS[plan].stripePriceId) {
+      console.log('❌ Prix toujours non disponible après création');
+      return res.status(400).json({ success: false, error: 'Impossible de configurer le prix Stripe' });
     }
     
     // Créer ou récupérer le client Stripe
@@ -2164,7 +2209,7 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
       payment_method_types: ['card'],
       mode: 'subscription',
       line_items: [{
-        price: planConfig.stripePriceId,
+        price: STRIPE_PLANS[plan].stripePriceId,
         quantity: 1
       }],
       subscription_data: {
@@ -2174,11 +2219,7 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
       cancel_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=cancelled`,
       metadata: { restaurantId, siret, plan },
       // Permettre la mise à jour de la carte pour les prélèvements futurs
-      payment_method_collection: 'always',
-      // Configurer les relances automatiques
-      subscription_data: {
-        metadata: { restaurantId, siret, plan },
-      }
+      payment_method_collection: 'always'
     });
     
     console.log(`✅ Session Stripe créée: ${session.id} pour ${enseigne} (${plan})`);
@@ -3884,6 +3925,24 @@ app.post('/api/subscription/process-payments', async (req, res) => {
 // =============================================
 async function startServer() {
   await connectDB();
+  
+  // Initialiser les prix Stripe au démarrage
+  try {
+    const settings = await getSettings();
+    if (settings?.stripeSecretKey && settings?.stripeEnabled) {
+      console.log('🔄 Initialisation des prix Stripe...');
+      const stripe = require('stripe')(settings.stripeSecretKey);
+      await initializeStripePrices(stripe);
+      console.log('✅ Prix Stripe initialisés:', {
+        simple: STRIPE_PLANS.simple.stripePriceId ? '✅' : '❌',
+        premium: STRIPE_PLANS.premium.stripePriceId ? '✅' : '❌'
+      });
+    } else {
+      console.log('⚠️ Stripe non configuré ou désactivé');
+    }
+  } catch (stripeError) {
+    console.error('⚠️ Erreur initialisation Stripe:', stripeError.message);
+  }
   
   app.listen(PORT, () => {
     console.log('');
