@@ -1274,18 +1274,35 @@ app.post('/api/restaurants/register', async (req, res) => {
       }
     }
     
-    const restaurantId = id || qrCode || uuidv4();
-    
-    if (qrCode) {
-      const existingQR = await getRestaurantByQRCode(qrCode);
-      if (existingQR) {
-        return res.status(409).json({ success: false, error: 'QR Code déjà utilisé' });
-      }
+    // Générer un QR Code au format QR-XXXXX
+    let newQRCode = qrCode;
+    if (!newQRCode || !newQRCode.startsWith('QR-')) {
+      // Trouver le prochain numéro disponible
+      const allRestaurants = await getRestaurants();
+      const existingNumbers = allRestaurants
+        .filter(r => r.qrCode && r.qrCode.startsWith('QR-'))
+        .map(r => parseInt(r.qrCode.replace('QR-', '')) || 0);
+      const maxNumber = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
+      newQRCode = `QR-${String(maxNumber + 1).padStart(5, '0')}`;
     }
+    
+    // Vérifier que le QR Code n'existe pas déjà
+    const existingQR = await getRestaurantByQRCode(newQRCode);
+    if (existingQR) {
+      // Générer un nouveau numéro
+      const allRestaurants = await getRestaurants();
+      const existingNumbers = allRestaurants
+        .filter(r => r.qrCode && r.qrCode.startsWith('QR-'))
+        .map(r => parseInt(r.qrCode.replace('QR-', '')) || 0);
+      const maxNumber = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
+      newQRCode = `QR-${String(maxNumber + 1).padStart(5, '0')}`;
+    }
+    
+    const restaurantId = id || newQRCode;
     
     await addRestaurant({
       id: restaurantId,
-      qrCode: qrCode || restaurantId,
+      qrCode: newQRCode,
       email: email || '',
       password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null,
       siret: siret || '',
@@ -1294,9 +1311,9 @@ app.post('/api/restaurants/register', async (req, res) => {
       dateRequest: new Date().toISOString()
     });
     
-    await auditLog('RESTAURANT_REGISTER', email || restaurantId, { status: 'pending' }, req);
+    await auditLog('RESTAURANT_REGISTER', email || restaurantId, { status: 'pending', qrCode: newQRCode }, req);
     
-    res.status(201).json({ success: true, id: restaurantId, qrCode: qrCode || restaurantId });
+    res.status(201).json({ success: true, id: restaurantId, qrCode: newQRCode });
   } catch (error) {
     console.error('Erreur register restaurant:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
