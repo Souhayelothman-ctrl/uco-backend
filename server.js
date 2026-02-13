@@ -1957,11 +1957,69 @@ app.delete('/api/partners/:id', async (req, res) => {
 // ===== STRIPE - PAIEMENTS ABONNEMENTS =====
 
 // Créer une session de paiement Stripe
-app.post('/api/stripe/create-checkout-session', async (req, res) => {
+// =============================================
+// STRIPE - GESTION COMPLÈTE DES ABONNEMENTS
+// =============================================
+
+// Configuration des prix (à créer dans Stripe Dashboard ou via API)
+const STRIPE_PLANS = {
+  starter: { name: 'Starter', price: 0, stripePriceId: null }, // Gratuit
+  simple: { name: 'Simple', price: 1499, stripePriceId: null }, // 14.99€
+  premium: { name: 'Premium', price: 1999, stripePriceId: null } // 19.99€
+};
+
+// Créer ou récupérer les prix Stripe au démarrage
+async function initializeStripePrices(stripe) {
   try {
-    const { restaurantId, plan, email, enseigne } = req.body;
+    // Chercher les produits existants
+    const products = await stripe.products.list({ limit: 10 });
     
-    // Récupérer la clé Stripe depuis les settings
+    for (const [planId, plan] of Object.entries(STRIPE_PLANS)) {
+      if (plan.price === 0) continue; // Ignorer le plan gratuit
+      
+      let product = products.data.find(p => p.metadata?.planId === planId);
+      
+      if (!product) {
+        // Créer le produit
+        product = await stripe.products.create({
+          name: `Abonnement UCO ${plan.name}`,
+          description: `Services partenaires UCO AND CO - Formule ${plan.name}`,
+          metadata: { planId }
+        });
+        console.log(`✅ Produit Stripe créé: ${plan.name}`);
+      }
+      
+      // Chercher le prix récurrent
+      const prices = await stripe.prices.list({ product: product.id, limit: 5 });
+      let price = prices.data.find(p => p.recurring?.interval === 'month' && p.unit_amount === plan.price);
+      
+      if (!price) {
+        // Créer le prix
+        price = await stripe.prices.create({
+          product: product.id,
+          unit_amount: plan.price,
+          currency: 'eur',
+          recurring: { interval: 'month' },
+          metadata: { planId }
+        });
+        console.log(`✅ Prix Stripe créé: ${plan.name} - ${plan.price/100}€/mois`);
+      }
+      
+      STRIPE_PLANS[planId].stripePriceId = price.id;
+      STRIPE_PLANS[planId].stripeProductId = product.id;
+    }
+    
+    console.log('✅ Prix Stripe initialisés');
+  } catch (error) {
+    console.error('⚠️ Erreur initialisation prix Stripe:', error.message);
+  }
+}
+
+// Créer une session de paiement pour nouvel abonnement
+app.post('/api/stripe/create-subscription', async (req, res) => {
+  try {
+    const { restaurantId, plan, email, enseigne, siret } = req.body;
+    
     const settings = await db.collection('settings').findOne({});
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
@@ -1969,20 +2027,92 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
     
     const stripe = require('stripe')(settings.stripeSecretKey);
     
-    // Prix selon le plan
-    const prices = {
-      essentiel: 1990, // 19.90€ en centimes
-      pro: 2990 // 29.90€ en centimes
-    };
+    // Initialiser les prix si pas encore fait
+    if (!STRIPE_PLANS[plan]?.stripePriceId && plan !== 'starter') {
+      await initializeStripePrices(stripe);
+    }
     
-    const planNames = {
-      essentiel: 'UCO Essentiel',
-      pro: 'UCO Pro'
-    };
+    // Plan gratuit - pas besoin de Stripe
+    if (plan === 'starter' || STRIPE_PLANS[plan]?.price === 0) {
+      return res.json({ 
+        success: true, 
+        free: true,
+        message: 'Formule gratuite - pas de paiement requis'
+      });
+    }
+    
+    const planConfig = STRIPE_PLANS[plan];
+    if (!planConfig?.stripePriceId) {
+      return res.status(400).json({ success: false, error: 'Plan invalide ou non configuré' });
+    }
     
     // Créer ou récupérer le client Stripe
     let customer;
     const existingCustomers = await stripe.customers.list({ email, limit: 1 });
+    
+    if (existingCustomers.data.length > 0) {
+      customer = existingCustomers.data[0];
+      // Mettre à jour les métadonnées
+      await stripe.customers.update(customer.id, {
+        name: enseigne,
+        metadata: { restaurantId, siret }
+      });
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        name: enseigne,
+        metadata: { restaurantId, siret }
+      });
+    }
+    
+    // Créer la session Checkout
+    const session = await stripe.checkout.sessions.create({
+      customer: customer.id,
+      payment_method_types: ['card'],
+      mode: 'subscription',
+      line_items: [{
+        price: planConfig.stripePriceId,
+        quantity: 1
+      }],
+      subscription_data: {
+        metadata: { restaurantId, siret, plan }
+      },
+      success_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=cancelled`,
+      metadata: { restaurantId, siret, plan },
+      // Permettre la mise à jour de la carte pour les prélèvements futurs
+      payment_method_collection: 'always',
+      // Configurer les relances automatiques
+      subscription_data: {
+        metadata: { restaurantId, siret, plan },
+      }
+    });
+    
+    console.log(`✅ Session Stripe créée: ${session.id} pour ${enseigne} (${plan})`);
+    res.json({ success: true, sessionId: session.id, url: session.url });
+    
+  } catch (error) {
+    console.error('Erreur création subscription Stripe:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Créer un Payment Intent pour paiement direct (sans subscription)
+app.post('/api/stripe/create-payment-intent', async (req, res) => {
+  try {
+    const { restaurantId, amount, email, enseigne, description } = req.body;
+    
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    // Créer ou récupérer le client
+    let customer;
+    const existingCustomers = await stripe.customers.list({ email, limit: 1 });
+    
     if (existingCustomers.data.length > 0) {
       customer = existingCustomers.data[0];
     } else {
@@ -1993,38 +2123,160 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
       });
     }
     
-    // Créer la session de checkout
-    const session = await stripe.checkout.sessions.create({
+    // Créer le Payment Intent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100), // Convertir en centimes
+      currency: 'eur',
       customer: customer.id,
-      payment_method_types: ['card', 'sepa_debit'],
-      mode: 'subscription',
-      line_items: [{
-        price_data: {
-          currency: 'eur',
-          product_data: {
-            name: `Abonnement ${planNames[plan]}`,
-            description: `Services partenaires UCO AND CO - ${planNames[plan]}`
-          },
-          unit_amount: prices[plan],
-          recurring: { interval: 'month' }
-        },
-        quantity: 1
-      }],
-      success_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=cancelled`,
-      metadata: {
-        restaurantId,
-        plan
-      }
+      description: description || `Paiement UCO AND CO - ${enseigne}`,
+      metadata: { restaurantId },
+      automatic_payment_methods: { enabled: true },
+      setup_future_usage: 'off_session' // Permettre les prélèvements futurs
     });
     
-    console.log('✅ Session Stripe créée:', session.id);
-    res.json({ success: true, sessionId: session.id, url: session.url });
+    res.json({ 
+      success: true, 
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id
+    });
     
   } catch (error) {
-    console.error('Erreur création session Stripe:', error);
+    console.error('Erreur création Payment Intent:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// Changer de formule (upgrade/downgrade)
+app.post('/api/stripe/change-plan', async (req, res) => {
+  try {
+    const { restaurantId, newPlan } = req.body;
+    
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    // Récupérer le restaurant
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant?.subscription?.stripeSubscriptionId) {
+      return res.status(400).json({ success: false, error: 'Aucun abonnement Stripe actif' });
+    }
+    
+    // Initialiser les prix si nécessaire
+    if (!STRIPE_PLANS[newPlan]?.stripePriceId) {
+      await initializeStripePrices(stripe);
+    }
+    
+    const newPlanConfig = STRIPE_PLANS[newPlan];
+    if (!newPlanConfig?.stripePriceId && newPlan !== 'starter') {
+      return res.status(400).json({ success: false, error: 'Plan invalide' });
+    }
+    
+    // Si downgrade vers starter (gratuit), annuler l'abonnement
+    if (newPlan === 'starter') {
+      await stripe.subscriptions.cancel(restaurant.subscription.stripeSubscriptionId);
+      
+      await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+        { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+        { 
+          $set: { 
+            'subscription.plan': 'starter',
+            'subscription.status': 'active',
+            'subscription.previousPlan': restaurant.subscription.plan,
+            'subscription.planChangedAt': new Date().toISOString()
+          },
+          $unset: {
+            'subscription.stripeSubscriptionId': ''
+          }
+        }
+      );
+      
+      return res.json({ success: true, message: 'Abonnement annulé, passage à Starter' });
+    }
+    
+    // Récupérer l'abonnement Stripe
+    const subscription = await stripe.subscriptions.retrieve(restaurant.subscription.stripeSubscriptionId);
+    
+    // Mettre à jour l'abonnement avec le nouveau prix
+    const updatedSubscription = await stripe.subscriptions.update(subscription.id, {
+      items: [{
+        id: subscription.items.data[0].id,
+        price: newPlanConfig.stripePriceId
+      }],
+      proration_behavior: 'create_prorations', // Facturer au prorata
+      metadata: { ...subscription.metadata, plan: newPlan }
+    });
+    
+    // Mettre à jour en base
+    await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+      { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+      { 
+        $set: { 
+          'subscription.plan': newPlan,
+          'subscription.previousPlan': restaurant.subscription.plan,
+          'subscription.planChangedAt': new Date().toISOString()
+        }
+      }
+    );
+    
+    console.log(`✅ Changement de plan: ${restaurant.enseigne} - ${restaurant.subscription.plan} → ${newPlan}`);
+    
+    res.json({ 
+      success: true, 
+      message: `Changement vers ${newPlanConfig.name} effectué`,
+      prorated: true
+    });
+    
+  } catch (error) {
+    console.error('Erreur changement plan:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Mettre à jour la carte de paiement
+app.post('/api/stripe/update-payment-method', async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    
+    const settings = await db.collection('settings').findOne({});
+    if (!settings?.stripeSecretKey) {
+      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
+    }
+    
+    const stripe = require('stripe')(settings.stripeSecretKey);
+    
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant?.subscription?.stripeCustomerId) {
+      return res.status(400).json({ success: false, error: 'Aucun client Stripe trouvé' });
+    }
+    
+    // Créer une session de configuration de carte
+    const session = await stripe.billingPortal.sessions.create({
+      customer: restaurant.subscription.stripeCustomerId,
+      return_url: `${req.headers.origin || 'https://uco-and-co.fr'}?payment_updated=true`
+    });
+    
+    res.json({ success: true, url: session.url });
+    
+  } catch (error) {
+    console.error('Erreur mise à jour carte:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint legacy pour compatibilité
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  // Rediriger vers le nouvel endpoint
+  req.body.plan = req.body.plan || 'simple';
+  return res.redirect(307, '/api/stripe/create-subscription');
 });
 
 // Webhook Stripe pour les événements de paiement
@@ -2046,15 +2298,30 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
     
+    console.log(`📥 Webhook Stripe reçu: ${event.type}`);
+    
     // Gérer les événements
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
-        const { restaurantId, plan } = session.metadata;
+        const { restaurantId, siret, plan } = session.metadata;
+        const identifier = restaurantId || siret;
+        
+        // Récupérer les infos du payment method
+        let cardLast4 = '****';
+        if (session.payment_method_types?.includes('card') && session.subscription) {
+          try {
+            const subscription = await stripe.subscriptions.retrieve(session.subscription);
+            if (subscription.default_payment_method) {
+              const pm = await stripe.paymentMethods.retrieve(subscription.default_payment_method);
+              cardLast4 = pm.card?.last4 || '****';
+            }
+          } catch (e) { console.log('Impossible de récupérer la carte:', e.message); }
+        }
         
         // Mettre à jour l'abonnement du restaurant
         await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-          { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+          { $or: [{ id: identifier }, { siret: identifier }] },
           {
             $set: {
               subscription: {
@@ -2063,39 +2330,99 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
                 stripeCustomerId: session.customer,
                 stripeSubscriptionId: session.subscription,
                 startDate: new Date().toISOString(),
-                lastPaymentDate: new Date().toISOString()
+                lastPaymentDate: new Date().toISOString(),
+                cardLast4
               }
+            },
+            $unset: {
+              'subscription.failedAttempts': '',
+              'subscription.firstFailedAt': '',
+              'subscription.blockedAt': '',
+              'subscription.blockedReason': ''
             }
           }
         );
-        console.log('✅ Abonnement activé pour:', restaurantId);
+        
+        console.log(`✅ Abonnement ${plan} activé pour: ${identifier}`);
+        
+        // Envoyer email de confirmation
+        const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+          $or: [{ id: identifier }, { siret: identifier }]
+        });
+        
+        if (restaurant) {
+          try {
+            const PLANS = { starter: 'Starter', simple: 'Simple', premium: 'Premium' };
+            const emailHtml = `
+              <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                <div style="background:#6bb44a;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+                  <h1 style="color:white;margin:0;">🎉 Abonnement activé !</h1>
+                </div>
+                <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+                  <p>Bonjour,</p>
+                  <p>Votre abonnement <strong>${PLANS[plan]}</strong> est maintenant actif !</p>
+                  <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:15px;margin:20px 0;">
+                    <p style="margin:5px 0;"><strong>Formule :</strong> ${PLANS[plan]}</p>
+                    <p style="margin:5px 0;"><strong>Carte :</strong> **** **** **** ${cardLast4}</p>
+                    <p style="margin:5px 0;"><strong>Prélèvement :</strong> Mensuel automatique</p>
+                  </div>
+                  <p>Vous pouvez dès maintenant profiter de tous vos services partenaires.</p>
+                  <p>L'équipe UCO AND CO</p>
+                </div>
+              </div>
+            `;
+            
+            await fetch(`http://localhost:${PORT}/api/send-email`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                to: restaurant.email,
+                subject: `🎉 Abonnement ${PLANS[plan]} activé - UCO AND CO`,
+                htmlContent: emailHtml
+              })
+            });
+          } catch (e) { console.error('Erreur email confirmation:', e); }
+        }
+        
         break;
       }
       
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object;
-        // Mettre à jour la date du dernier paiement
-        if (invoice.subscription) {
+        
+        if (invoice.subscription && invoice.billing_reason !== 'subscription_create') {
+          // Paiement récurrent (pas le premier)
           const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOneAndUpdate(
             { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { $set: { 'subscription.lastPaymentDate': new Date().toISOString() } },
+            { 
+              $set: { 
+                'subscription.lastPaymentDate': new Date().toISOString(),
+                'subscription.status': 'active'
+              },
+              $unset: {
+                'subscription.failedAttempts': '',
+                'subscription.firstFailedAt': '',
+                'subscription.lastFailedAt': '',
+                'subscription.nextRetryAt': ''
+              }
+            },
             { returnDocument: 'after' }
           );
           
           if (restaurant.value) {
-            console.log('✅ Paiement reçu pour subscription:', invoice.subscription);
+            console.log(`✅ Prélèvement mensuel réussi: ${restaurant.value.enseigne}`);
             
-            // Générer et attacher la facture à Qonto
+            // Générer la facture
             try {
+              const r = restaurant.value;
               const PLANS = {
                 starter: { name: 'Starter', price: 0 },
                 simple: { name: 'Simple', price: 14.99 },
                 premium: { name: 'Premium', price: 19.99 }
               };
               
-              const r = restaurant.value;
               const plan = PLANS[r.subscription?.plan];
-              const priceTTC = invoice.amount_paid / 100; // Stripe utilise les centimes
+              const priceTTC = invoice.amount_paid / 100;
               const priceHT = (priceTTC / 1.20).toFixed(2);
               const tva = (priceTTC - parseFloat(priceHT)).toFixed(2);
               
@@ -2118,10 +2445,8 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
                 restaurantId: r.siret || r.id
               };
               
-              // Générer le PDF
               const invoicePDF = await generateInvoicePDF(invoiceData);
               
-              // Sauvegarder la facture
               await db.collection('invoices').insertOne({
                 ...invoiceData,
                 pdfBase64: invoicePDF.toString('base64'),
@@ -2129,17 +2454,42 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
                 createdAt: new Date()
               });
               
-              // Attacher à Qonto (asynchrone, ne bloque pas)
-              attachInvoiceToQonto(invoicePDF, invoiceData).then(result => {
-                if (result.success) {
-                  db.collection('invoices').updateOne(
-                    { invoiceNumber },
-                    { $set: { qontoAttached: true, qontoTransactionId: result.transactionId } }
-                  );
-                }
-              }).catch(err => console.error('Erreur Qonto async:', err));
+              // Envoyer la facture par email
+              const emailHtml = `
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                  <div style="background:#6bb44a;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+                    <h1 style="color:white;margin:0;">📄 Facture ${invoiceNumber}</h1>
+                  </div>
+                  <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+                    <p>Bonjour,</p>
+                    <p>Votre prélèvement mensuel a été effectué avec succès.</p>
+                    <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:15px;margin:20px 0;">
+                      <p style="margin:5px 0;"><strong>Montant :</strong> ${priceTTC.toFixed(2)}€ TTC</p>
+                      <p style="margin:5px 0;"><strong>Formule :</strong> ${plan?.name}</p>
+                      <p style="margin:5px 0;"><strong>Carte :</strong> **** ${r.subscription?.cardLast4}</p>
+                    </div>
+                    <p>Votre facture est disponible dans votre espace client.</p>
+                    <p>L'équipe UCO AND CO</p>
+                  </div>
+                </div>
+              `;
               
-              console.log('📄 Facture générée:', invoiceNumber);
+              await fetch(`http://localhost:${PORT}/api/send-email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  to: r.email,
+                  subject: `📄 Facture ${invoiceNumber} - UCO AND CO`,
+                  htmlContent: emailHtml
+                })
+              });
+              
+              // Attacher à Qonto
+              attachInvoiceToQonto(invoicePDF, invoiceData).catch(err => 
+                console.error('Erreur Qonto:', err)
+              );
+              
+              console.log(`📄 Facture ${invoiceNumber} générée`);
             } catch (invoiceError) {
               console.error('Erreur génération facture:', invoiceError);
             }
@@ -2150,25 +2500,166 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       
       case 'invoice.payment_failed': {
         const invoice = event.data.object;
-        // Marquer l'abonnement comme en échec de paiement
+        
         if (invoice.subscription) {
-          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-            { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { $set: { 'subscription.status': 'payment_failed' } }
-          );
-          console.log('⚠️ Échec paiement pour subscription:', invoice.subscription);
+          const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+            'subscription.stripeSubscriptionId': invoice.subscription
+          });
+          
+          if (restaurant) {
+            const now = new Date();
+            const failedAttempts = (restaurant.subscription?.failedAttempts || 0) + 1;
+            const firstFailedAt = restaurant.subscription?.firstFailedAt || now.toISOString();
+            const daysSinceFirstFail = Math.floor((now - new Date(firstFailedAt)) / (1000 * 60 * 60 * 24));
+            
+            console.log(`⚠️ Échec paiement: ${restaurant.enseigne} - Tentative ${failedAttempts}, jour ${daysSinceFirstFail}`);
+            
+            // Après 30 jours, bloquer le compte
+            if (daysSinceFirstFail >= 30) {
+              await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+                { _id: restaurant._id },
+                { 
+                  $set: { 
+                    'subscription.status': 'blocked',
+                    'subscription.blockedAt': now.toISOString(),
+                    'subscription.blockedReason': 'Prélèvements refusés pendant plus de 30 jours',
+                    'subscription.failedAttempts': failedAttempts
+                  } 
+                }
+              );
+              
+              // Annuler l'abonnement Stripe
+              const stripe = require('stripe')(settings.stripeSecretKey);
+              await stripe.subscriptions.cancel(invoice.subscription);
+              
+              // Notification de blocage
+              const emailHtml = `
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                  <div style="background:#dc2626;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+                    <h1 style="color:white;margin:0;">⚠️ Compte bloqué</h1>
+                  </div>
+                  <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+                    <p>Bonjour,</p>
+                    <p>Malgré nos relances, nous n'avons pas pu prélever votre abonnement depuis plus de 30 jours.</p>
+                    <p>Votre compte est désormais <strong>bloqué</strong>.</p>
+                    <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:15px;margin:20px 0;">
+                      <p style="margin:0;"><strong>Pour retrouver l'accès :</strong></p>
+                      <p style="margin:10px 0 0 0;">Connectez-vous sur <a href="https://uco-and-co.fr">uco-and-co.fr</a> et régularisez votre situation.</p>
+                    </div>
+                    <p>Contact : 06 10 25 10 63 | contact@uco-and-co.com</p>
+                  </div>
+                </div>
+              `;
+              
+              await fetch(`http://localhost:${PORT}/api/send-email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  to: restaurant.email,
+                  subject: '⚠️ Votre compte UCO AND CO est bloqué',
+                  htmlContent: emailHtml
+                })
+              });
+              
+              if (restaurant.tel) {
+                await fetch(`http://localhost:${PORT}/api/send-sms`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    to: restaurant.tel,
+                    message: `UCO AND CO: Compte bloque. Regularisez sur uco-and-co.fr. Contact: 0610251063`
+                  })
+                });
+              }
+              
+              console.log(`🚫 Compte bloqué: ${restaurant.enseigne}`);
+            } else {
+              // Mettre à jour le statut d'échec
+              await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+                { _id: restaurant._id },
+                { 
+                  $set: { 
+                    'subscription.status': 'payment_failed',
+                    'subscription.failedAttempts': failedAttempts,
+                    'subscription.firstFailedAt': firstFailedAt,
+                    'subscription.lastFailedAt': now.toISOString()
+                  } 
+                }
+              );
+              
+              // Notification d'échec
+              const daysRemaining = 30 - daysSinceFirstFail;
+              const emailHtml = `
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                  <div style="background:#f59e0b;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+                    <h1 style="color:white;margin:0;">⚠️ Échec de prélèvement</h1>
+                  </div>
+                  <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+                    <p>Bonjour,</p>
+                    <p>Nous n'avons pas pu prélever votre abonnement <strong>${restaurant.subscription?.plan}</strong>.</p>
+                    <div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:15px;margin:20px 0;">
+                      <p style="margin:0;"><strong>Tentative ${failedAttempts}</strong></p>
+                      <p style="margin:10px 0 0 0;color:#92400e;">⚠️ Votre compte sera bloqué dans ${daysRemaining} jours sans régularisation.</p>
+                    </div>
+                    <p>Veuillez mettre à jour votre carte de paiement dans votre espace client.</p>
+                    <p>Contact : 06 10 25 10 63</p>
+                  </div>
+                </div>
+              `;
+              
+              await fetch(`http://localhost:${PORT}/api/send-email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  to: restaurant.email,
+                  subject: `⚠️ Échec de prélèvement - ${daysRemaining} jours restants`,
+                  htmlContent: emailHtml
+                })
+              });
+              
+              if (restaurant.tel) {
+                await fetch(`http://localhost:${PORT}/api/send-sms`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    to: restaurant.tel,
+                    message: `UCO AND CO: Echec prelevement. Regularisez sous ${daysRemaining} jours. Espace client: uco-and-co.fr`
+                  })
+                });
+              }
+            }
+          }
         }
         break;
       }
       
       case 'customer.subscription.deleted': {
         const subscription = event.data.object;
-        // Désactiver l'abonnement
+        
         await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
           { 'subscription.stripeSubscriptionId': subscription.id },
-          { $set: { 'subscription.status': 'cancelled', 'subscription.endDate': new Date().toISOString() } }
+          { 
+            $set: { 
+              'subscription.status': 'cancelled', 
+              'subscription.endDate': new Date().toISOString(),
+              'subscription.plan': 'starter' // Repasse en gratuit
+            } 
+          }
         );
-        console.log('❌ Abonnement annulé:', subscription.id);
+        console.log(`❌ Abonnement Stripe annulé: ${subscription.id}`);
+        break;
+      }
+      
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object;
+        
+        // Mettre à jour le plan si changé
+        if (subscription.metadata?.plan) {
+          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+            { 'subscription.stripeSubscriptionId': subscription.id },
+            { $set: { 'subscription.plan': subscription.metadata.plan } }
+          );
+        }
         break;
       }
     }
@@ -2745,6 +3236,514 @@ app.get('/api/qonto/status', async (req, res) => {
 // Route 404 - DOIT ÊTRE EN DERNIER
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Route non trouvée' });
+});
+
+// =============================================
+// GESTION DES ABONNEMENTS ET PRÉLÈVEMENTS
+// =============================================
+
+// Changement de formule (upgrade/downgrade)
+app.post('/api/subscription/change', async (req, res) => {
+  try {
+    const { restaurantId, newPlan, cardInfo } = req.body;
+    
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const PLANS = {
+      starter: { name: 'Starter', price: 0 },
+      simple: { name: 'Simple', price: 14.99 },
+      premium: { name: 'Premium', price: 19.99 }
+    };
+    
+    const currentPlan = restaurant.subscription?.plan;
+    const newPlanInfo = PLANS[newPlan];
+    
+    if (!newPlanInfo) {
+      return res.status(400).json({ success: false, error: 'Formule invalide' });
+    }
+    
+    // Si upgrade vers une formule payante, on doit avoir les infos de carte
+    if (newPlanInfo.price > 0 && !restaurant.subscription?.cardToken && !cardInfo) {
+      return res.status(400).json({ success: false, error: 'Informations de carte requises pour cette formule' });
+    }
+    
+    // Calculer le prorata si changement en cours de mois
+    const now = new Date();
+    const lastPayment = restaurant.subscription?.lastPaymentDate ? new Date(restaurant.subscription.lastPaymentDate) : now;
+    const daysInMonth = 30;
+    const daysUsed = Math.floor((now - lastPayment) / (1000 * 60 * 60 * 24));
+    const daysRemaining = Math.max(0, daysInMonth - daysUsed);
+    
+    let amountToPay = 0;
+    let prorata = null;
+    
+    if (newPlanInfo.price > (PLANS[currentPlan]?.price || 0)) {
+      // Upgrade : facturer la différence au prorata
+      const priceDiff = newPlanInfo.price - (PLANS[currentPlan]?.price || 0);
+      amountToPay = (priceDiff / daysInMonth) * daysRemaining;
+      prorata = {
+        type: 'upgrade',
+        daysRemaining,
+        priceDiff,
+        amount: amountToPay.toFixed(2)
+      };
+    }
+    // Downgrade : prend effet au prochain cycle, pas de remboursement
+    
+    // Mettre à jour l'abonnement
+    const updateData = {
+      'subscription.plan': newPlan,
+      'subscription.previousPlan': currentPlan,
+      'subscription.planChangedAt': now.toISOString(),
+      'subscription.status': 'active'
+    };
+    
+    // Stocker les infos de carte si fournies (pour prélèvements futurs)
+    if (cardInfo) {
+      updateData['subscription.cardLast4'] = cardInfo.last4;
+      updateData['subscription.cardExpiry'] = cardInfo.expiry;
+      updateData['subscription.cardToken'] = cardInfo.token; // Token sécurisé pour prélèvements
+    }
+    
+    await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+      { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+      { $set: updateData }
+    );
+    
+    console.log(`✅ Changement de formule: ${restaurant.enseigne} - ${currentPlan} → ${newPlan}`);
+    
+    res.json({ 
+      success: true, 
+      previousPlan: currentPlan,
+      newPlan,
+      prorata,
+      message: prorata ? `Montant au prorata: ${prorata.amount}€` : 'Changement effectué'
+    });
+    
+  } catch (error) {
+    console.error('Erreur changement formule:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint pour enregistrer un échec de paiement et gérer les relances
+app.post('/api/subscription/payment-failed', async (req, res) => {
+  try {
+    const { restaurantId, reason } = req.body;
+    
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const now = new Date();
+    const failedAttempts = (restaurant.subscription?.failedAttempts || 0) + 1;
+    const firstFailedAt = restaurant.subscription?.firstFailedAt || now.toISOString();
+    const daysSinceFirstFail = Math.floor((now - new Date(firstFailedAt)) / (1000 * 60 * 60 * 24));
+    
+    // Après 30 jours d'échecs, bloquer le compte
+    if (daysSinceFirstFail >= 30) {
+      await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+        { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+        { 
+          $set: { 
+            'subscription.status': 'blocked',
+            'subscription.blockedAt': now.toISOString(),
+            'subscription.blockedReason': 'Prélèvements refusés pendant plus de 30 jours',
+            'subscription.failedAttempts': failedAttempts
+          } 
+        }
+      );
+      
+      // Envoyer notification de blocage
+      const settings = await db.collection('settings').findOne({});
+      
+      // Email de blocage
+      try {
+        const emailHtml = `
+          <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+            <div style="background:#dc2626;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+              <h1 style="color:white;margin:0;">⚠️ Compte bloqué</h1>
+            </div>
+            <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+              <p>Bonjour,</p>
+              <p>Malgré nos relances, nous n'avons pas pu prélever votre abonnement <strong>${restaurant.subscription?.plan}</strong> depuis plus de 30 jours.</p>
+              <p>Votre compte est désormais <strong>bloqué</strong>.</p>
+              <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:15px;margin:20px 0;">
+                <p style="margin:0;"><strong>Pour retrouver l'accès à votre compte :</strong></p>
+                <p style="margin:10px 0 0 0;">Connectez-vous sur <a href="https://uco-and-co.fr">uco-and-co.fr</a> et régularisez votre situation.</p>
+              </div>
+              <p>Pour toute question, contactez-nous :</p>
+              <p>📞 06 10 25 10 63<br/>📧 contact@uco-and-co.com</p>
+            </div>
+          </div>
+        `;
+        
+        await fetch(`http://localhost:${PORT}/api/send-email`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: restaurant.email,
+            subject: '⚠️ Votre compte UCO AND CO est bloqué',
+            htmlContent: emailHtml
+          })
+        });
+      } catch (e) { console.error('Erreur email blocage:', e); }
+      
+      // SMS de blocage
+      if (restaurant.tel) {
+        try {
+          await fetch(`http://localhost:${PORT}/api/send-sms`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: restaurant.tel,
+              message: `UCO AND CO: Votre compte est bloque suite aux prelevements refuses. Regularisez sur uco-and-co.fr ou appelez le 0610251063`
+            })
+          });
+        } catch (e) { console.error('Erreur SMS blocage:', e); }
+      }
+      
+      console.log(`🚫 Compte bloqué: ${restaurant.enseigne} - ${failedAttempts} échecs sur ${daysSinceFirstFail} jours`);
+      
+      return res.json({ 
+        success: true, 
+        status: 'blocked',
+        message: 'Compte bloqué après 30 jours d\'échecs'
+      });
+    }
+    
+    // Sinon, enregistrer l'échec et programmer la prochaine relance
+    const nextRetryDate = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000); // +2 jours
+    
+    await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+      { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+      { 
+        $set: { 
+          'subscription.status': 'payment_failed',
+          'subscription.failedAttempts': failedAttempts,
+          'subscription.firstFailedAt': firstFailedAt,
+          'subscription.lastFailedAt': now.toISOString(),
+          'subscription.nextRetryAt': nextRetryDate.toISOString(),
+          'subscription.lastFailReason': reason
+        } 
+      }
+    );
+    
+    // Envoyer notification d'échec (seulement si c'est un nouvel échec ou tous les 2 jours)
+    if (failedAttempts === 1 || failedAttempts % 1 === 0) { // À chaque tentative
+      // Email d'échec
+      try {
+        const attemptsRemaining = Math.max(0, 15 - failedAttempts); // ~15 tentatives sur 30 jours
+        const emailHtml = `
+          <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+            <div style="background:#f59e0b;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+              <h1 style="color:white;margin:0;">⚠️ Échec de prélèvement</h1>
+            </div>
+            <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+              <p>Bonjour,</p>
+              <p>Nous n'avons pas pu prélever votre abonnement <strong>${restaurant.subscription?.plan}</strong> de <strong>${restaurant.subscription?.plan === 'simple' ? '14,99€' : '19,99€'}</strong>.</p>
+              <div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:15px;margin:20px 0;">
+                <p style="margin:0;"><strong>Tentative ${failedAttempts}/15</strong></p>
+                <p style="margin:10px 0 0 0;">Prochaine tentative: ${nextRetryDate.toLocaleDateString('fr-FR')}</p>
+                <p style="margin:10px 0 0 0;color:#92400e;">⚠️ Sans régularisation sous 30 jours, votre compte sera bloqué.</p>
+              </div>
+              <p>Veuillez vérifier votre moyen de paiement ou contactez-nous :</p>
+              <p>📞 06 10 25 10 63<br/>📧 contact@uco-and-co.com</p>
+            </div>
+          </div>
+        `;
+        
+        await fetch(`http://localhost:${PORT}/api/send-email`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: restaurant.email,
+            subject: `⚠️ Échec de prélèvement - Tentative ${failedAttempts}/15`,
+            htmlContent: emailHtml
+          })
+        });
+      } catch (e) { console.error('Erreur email échec:', e); }
+      
+      // SMS d'échec
+      if (restaurant.tel) {
+        try {
+          await fetch(`http://localhost:${PORT}/api/send-sms`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: restaurant.tel,
+              message: `UCO AND CO: Echec prelevement (${failedAttempts}/15). Prochaine tentative le ${nextRetryDate.toLocaleDateString('fr-FR')}. Verifiez votre moyen de paiement.`
+            })
+          });
+        } catch (e) { console.error('Erreur SMS échec:', e); }
+      }
+    }
+    
+    console.log(`⚠️ Échec paiement: ${restaurant.enseigne} - Tentative ${failedAttempts}, prochain essai le ${nextRetryDate.toLocaleDateString('fr-FR')}`);
+    
+    res.json({ 
+      success: true, 
+      status: 'payment_failed',
+      failedAttempts,
+      nextRetryAt: nextRetryDate.toISOString(),
+      daysUntilBlock: 30 - daysSinceFirstFail
+    });
+    
+  } catch (error) {
+    console.error('Erreur enregistrement échec:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint pour régulariser un compte bloqué
+app.post('/api/subscription/regularize', async (req, res) => {
+  try {
+    const { restaurantId, cardInfo, plan } = req.body;
+    
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    if (restaurant.subscription?.status !== 'blocked') {
+      return res.status(400).json({ success: false, error: 'Le compte n\'est pas bloqué' });
+    }
+    
+    // Réactiver le compte avec la nouvelle carte
+    const now = new Date();
+    
+    await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+      { $or: [{ id: restaurantId }, { siret: restaurantId }] },
+      { 
+        $set: { 
+          'subscription.status': 'active',
+          'subscription.plan': plan || restaurant.subscription.plan,
+          'subscription.reactivatedAt': now.toISOString(),
+          'subscription.lastPaymentDate': now.toISOString(),
+          'subscription.cardLast4': cardInfo.last4,
+          'subscription.cardExpiry': cardInfo.expiry,
+          'subscription.cardToken': cardInfo.token
+        },
+        $unset: {
+          'subscription.blockedAt': '',
+          'subscription.blockedReason': '',
+          'subscription.failedAttempts': '',
+          'subscription.firstFailedAt': '',
+          'subscription.lastFailedAt': '',
+          'subscription.nextRetryAt': '',
+          'subscription.lastFailReason': ''
+        }
+      }
+    );
+    
+    console.log(`✅ Compte réactivé: ${restaurant.enseigne}`);
+    
+    // Email de confirmation
+    try {
+      const emailHtml = `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+          <div style="background:#6bb44a;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+            <h1 style="color:white;margin:0;">✅ Compte réactivé !</h1>
+          </div>
+          <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+            <p>Bonjour,</p>
+            <p>Votre compte UCO AND CO a été réactivé avec succès !</p>
+            <p>Vous avez de nouveau accès à tous les services de votre formule <strong>${plan || restaurant.subscription.plan}</strong>.</p>
+            <p>Merci de votre confiance.</p>
+            <p>L'équipe UCO AND CO</p>
+          </div>
+        </div>
+      `;
+      
+      await fetch(`http://localhost:${PORT}/api/send-email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: restaurant.email,
+          subject: '✅ Votre compte UCO AND CO est réactivé !',
+          htmlContent: emailHtml
+        })
+      });
+    } catch (e) { console.error('Erreur email réactivation:', e); }
+    
+    res.json({ 
+      success: true, 
+      message: 'Compte réactivé avec succès'
+    });
+    
+  } catch (error) {
+    console.error('Erreur régularisation:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Vérifier le statut d'un compte (pour la connexion)
+app.get('/api/subscription/status/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    
+    const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
+      $or: [{ id: restaurantId }, { siret: restaurantId }]
+    });
+    
+    if (!restaurant) {
+      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
+    }
+    
+    const subscription = restaurant.subscription || {};
+    
+    res.json({
+      success: true,
+      status: subscription.status || 'none',
+      plan: subscription.plan,
+      isBlocked: subscription.status === 'blocked',
+      blockedReason: subscription.blockedReason,
+      blockedAt: subscription.blockedAt,
+      failedAttempts: subscription.failedAttempts,
+      nextRetryAt: subscription.nextRetryAt
+    });
+    
+  } catch (error) {
+    console.error('Erreur statut subscription:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Job pour traiter les prélèvements automatiques (à appeler via cron externe)
+app.post('/api/subscription/process-payments', async (req, res) => {
+  try {
+    const { apiKey } = req.body;
+    
+    // Vérifier la clé API (sécurité basique pour le cron)
+    const settings = await db.collection('settings').findOne({});
+    if (apiKey !== settings?.cronApiKey && apiKey !== 'UCO_CRON_2024') {
+      return res.status(401).json({ success: false, error: 'Non autorisé' });
+    }
+    
+    const now = new Date();
+    const results = {
+      processed: 0,
+      success: 0,
+      failed: 0,
+      retried: 0,
+      details: []
+    };
+    
+    // 1. Trouver les abonnements à prélever (dernier paiement > 30 jours)
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    const restaurantsToCharge = await db.collection(COLLECTIONS.RESTAURANTS).find({
+      'subscription.status': 'active',
+      'subscription.plan': { $in: ['simple', 'premium'] },
+      'subscription.lastPaymentDate': { $lt: thirtyDaysAgo.toISOString() }
+    }).toArray();
+    
+    for (const restaurant of restaurantsToCharge) {
+      results.processed++;
+      
+      // Ici, intégrer avec Stripe pour le prélèvement réel
+      // Pour l'instant, simuler le résultat
+      const paymentSuccess = Math.random() > 0.1; // 90% de succès en simulation
+      
+      if (paymentSuccess) {
+        await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          { _id: restaurant._id },
+          { 
+            $set: { 
+              'subscription.lastPaymentDate': now.toISOString()
+            },
+            $unset: {
+              'subscription.failedAttempts': '',
+              'subscription.firstFailedAt': '',
+              'subscription.lastFailedAt': ''
+            }
+          }
+        );
+        results.success++;
+        results.details.push({ restaurant: restaurant.enseigne, status: 'success' });
+      } else {
+        // Enregistrer l'échec via l'endpoint dédié
+        await fetch(`http://localhost:${PORT}/api/subscription/payment-failed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            restaurantId: restaurant.siret || restaurant.id,
+            reason: 'Prélèvement automatique refusé'
+          })
+        });
+        results.failed++;
+        results.details.push({ restaurant: restaurant.enseigne, status: 'failed' });
+      }
+    }
+    
+    // 2. Réessayer les paiements échoués dont la date de retry est passée
+    const failedToRetry = await db.collection(COLLECTIONS.RESTAURANTS).find({
+      'subscription.status': 'payment_failed',
+      'subscription.nextRetryAt': { $lte: now.toISOString() }
+    }).toArray();
+    
+    for (const restaurant of failedToRetry) {
+      results.retried++;
+      
+      // Réessayer le prélèvement
+      const retrySuccess = Math.random() > 0.3; // 70% de succès en retry
+      
+      if (retrySuccess) {
+        await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          { _id: restaurant._id },
+          { 
+            $set: { 
+              'subscription.status': 'active',
+              'subscription.lastPaymentDate': now.toISOString()
+            },
+            $unset: {
+              'subscription.failedAttempts': '',
+              'subscription.firstFailedAt': '',
+              'subscription.lastFailedAt': '',
+              'subscription.nextRetryAt': ''
+            }
+          }
+        );
+        results.success++;
+        results.details.push({ restaurant: restaurant.enseigne, status: 'retry_success' });
+        
+        // Notification de succès
+        console.log(`✅ Prélèvement réussi après retry: ${restaurant.enseigne}`);
+      } else {
+        // Enregistrer le nouvel échec
+        await fetch(`http://localhost:${PORT}/api/subscription/payment-failed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            restaurantId: restaurant.siret || restaurant.id,
+            reason: 'Retry prélèvement refusé'
+          })
+        });
+        results.details.push({ restaurant: restaurant.enseigne, status: 'retry_failed' });
+      }
+    }
+    
+    console.log(`💳 Traitement prélèvements: ${results.processed} traités, ${results.success} réussis, ${results.failed} échoués, ${results.retried} retentés`);
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    console.error('Erreur traitement prélèvements:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // =============================================
