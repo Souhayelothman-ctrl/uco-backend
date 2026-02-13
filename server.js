@@ -191,6 +191,46 @@ const cache = {
   TTL: 60000 // 1 minute
 };
 
+// Fonction utilitaire pour récupérer les settings de manière fiable
+async function getSettings() {
+  try {
+    // Vérifier le cache
+    if (cache.settings && (Date.now() - cache.lastSettingsUpdate) < cache.TTL) {
+      return cache.settings;
+    }
+    
+    // Récupérer tous les documents settings et les fusionner
+    const allSettings = await db.collection('settings').find({}).toArray();
+    
+    if (allSettings.length === 0) {
+      console.log('⚠️ Aucun document settings trouvé');
+      return null;
+    }
+    
+    // Fusionner tous les documents en un seul (le plus récent écrase)
+    let mergedSettings = {};
+    for (const doc of allSettings) {
+      mergedSettings = { ...mergedSettings, ...doc };
+    }
+    
+    // Mettre à jour le cache
+    cache.settings = mergedSettings;
+    cache.lastSettingsUpdate = Date.now();
+    
+    console.log('✅ Settings chargés:', {
+      hasStripeSecretKey: !!mergedSettings.stripeSecretKey,
+      hasStripePublicKey: !!mergedSettings.stripePublicKey,
+      stripeEnabled: mergedSettings.stripeEnabled,
+      qontoEnabled: mergedSettings.qontoEnabled
+    });
+    
+    return mergedSettings;
+  } catch (error) {
+    console.error('❌ Erreur récupération settings:', error);
+    return null;
+  }
+}
+
 // =============================================
 // FONCTIONS UTILITAIRES DE SÉCURITÉ
 // =============================================
@@ -403,49 +443,85 @@ process.on('SIGTERM', async () => {
 // FONCTIONS D'ACCÈS AUX DONNÉES
 // =============================================
 
-async function getSettings() {
-  if (!db) return initialData.settings;
-  
-  if (cache.settings && Date.now() - cache.lastSettingsUpdate < cache.TTL) {
-    return cache.settings;
-  }
-  
-  const doc = await db.collection(COLLECTIONS.SETTINGS).findOne({ _id: 'main' });
-  cache.settings = doc || initialData.settings;
-  cache.lastSettingsUpdate = Date.now();
-  return cache.settings;
-}
+// getSettings est définie plus haut avec gestion robuste des documents multiples
 
 async function updateSettings(newSettings) {
   if (!db) return false;
   
-  // Récupérer les settings existants pour les préserver
-  const existingSettings = await getSettings();
-  
-  // Merger les nouveaux settings avec les existants (préserver admin et autres champs)
-  const mergedSettings = {
-    ...existingSettings,
-    ...newSettings,
-    // Préserver les sous-objets importants
-    admin: existingSettings.admin, // Ne jamais écraser admin via cette fonction
-    reviewLinks: {
-      ...(existingSettings.reviewLinks || {}),
-      ...(newSettings.reviewLinks || {})
+  try {
+    // Récupérer les settings existants pour les préserver
+    const existingSettings = await getSettings() || {};
+    
+    // Merger les nouveaux settings avec les existants (préserver admin et autres champs)
+    const mergedSettings = {
+      ...existingSettings,
+      ...newSettings,
+      // Préserver les sous-objets importants
+      admin: existingSettings.admin, // Ne jamais écraser admin via cette fonction
+      reviewLinks: {
+        ...(existingSettings.reviewLinks || {}),
+        ...(newSettings.reviewLinks || {})
+      }
+    };
+    
+    // Si brevoApiKey n'est pas fourni, garder l'ancien
+    if (!newSettings.brevoApiKey && existingSettings.brevoApiKey) {
+      mergedSettings.brevoApiKey = existingSettings.brevoApiKey;
     }
-  };
-  
-  // Si brevoApiKey n'est pas fourni, garder l'ancien
-  if (!newSettings.brevoApiKey && existingSettings.brevoApiKey) {
-    mergedSettings.brevoApiKey = existingSettings.brevoApiKey;
+    
+    // Si stripeSecretKey n'est pas fourni, garder l'ancien
+    if (!newSettings.stripeSecretKey && existingSettings.stripeSecretKey) {
+      mergedSettings.stripeSecretKey = existingSettings.stripeSecretKey;
+    }
+    
+    // Si stripePublicKey n'est pas fourni ou est masqué, garder l'ancien
+    if ((!newSettings.stripePublicKey || newSettings.stripePublicKey.startsWith('••••')) && existingSettings.stripePublicKey) {
+      mergedSettings.stripePublicKey = existingSettings.stripePublicKey;
+    }
+    
+    // Si stripeWebhookSecret n'est pas fourni, garder l'ancien
+    if (!newSettings.stripeWebhookSecret && existingSettings.stripeWebhookSecret) {
+      mergedSettings.stripeWebhookSecret = existingSettings.stripeWebhookSecret;
+    }
+    
+    // Si qontoSecretKey n'est pas fourni, garder l'ancien
+    if (!newSettings.qontoSecretKey && existingSettings.qontoSecretKey) {
+      mergedSettings.qontoSecretKey = existingSettings.qontoSecretKey;
+    }
+    
+    // Si qontoOrganizationId n'est pas fourni, garder l'ancien
+    if (!newSettings.qontoOrganizationId && existingSettings.qontoOrganizationId) {
+      mergedSettings.qontoOrganizationId = existingSettings.qontoOrganizationId;
+    }
+    
+    // Si qontoOrganizationName n'est pas fourni, garder l'ancien
+    if (!newSettings.qontoOrganizationName && existingSettings.qontoOrganizationName) {
+      mergedSettings.qontoOrganizationName = existingSettings.qontoOrganizationName;
+    }
+    
+    // Supprimer _id du merged pour éviter les erreurs
+    delete mergedSettings._id;
+    
+    // Trouver le document existant ou utiliser 'main' comme fallback
+    const existingDoc = await db.collection(COLLECTIONS.SETTINGS).findOne({});
+    const docId = existingDoc?._id || 'main';
+    
+    await db.collection(COLLECTIONS.SETTINGS).updateOne(
+      { _id: docId },
+      { $set: mergedSettings },
+      { upsert: true }
+    );
+    
+    // Invalider le cache
+    cache.settings = null;
+    cache.lastSettingsUpdate = 0;
+    
+    console.log('✅ Settings mis à jour avec succès');
+    return true;
+  } catch (error) {
+    console.error('❌ Erreur updateSettings:', error);
+    return false;
   }
-  
-  await db.collection(COLLECTIONS.SETTINGS).updateOne(
-    { _id: 'main' },
-    { $set: mergedSettings },
-    { upsert: true }
-  );
-  cache.settings = null;
-  return true;
 }
 
 async function getAdmin() {
@@ -2037,7 +2113,7 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
   try {
     const { restaurantId, plan, email, enseigne, siret } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2119,7 +2195,7 @@ app.post('/api/stripe/create-payment-intent', async (req, res) => {
   try {
     const { restaurantId, amount, email, enseigne, description } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2168,7 +2244,7 @@ app.post('/api/stripe/change-plan', async (req, res) => {
   try {
     const { restaurantId, newPlan } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2260,7 +2336,7 @@ app.post('/api/stripe/update-payment-method', async (req, res) => {
   try {
     const { restaurantId } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2299,7 +2375,7 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
 // Webhook Stripe pour les événements de paiement
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) {
       return res.status(400).json({ error: 'Stripe non configuré' });
     }
@@ -2694,7 +2770,7 @@ app.post('/api/stripe/cancel-subscription', async (req, res) => {
   try {
     const { subscriptionId } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2720,7 +2796,7 @@ app.post('/api/stripe/customer-portal', async (req, res) => {
   try {
     const { customerId } = req.body;
     
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (!settings?.stripeSecretKey) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
@@ -2790,6 +2866,46 @@ app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Erreur suppression avis:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// Marquer un avis comme lu
+app.post('/api/avis/:id/read', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const { id } = req.params;
+    
+    await db.collection(COLLECTIONS.AVIS).updateOne(
+      { $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }] },
+      { $set: { isRead: true, readAt: new Date().toISOString() } }
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erreur marquage avis lu:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// Marquer tous les avis comme lus
+app.post('/api/avis/mark-all-read', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const result = await db.collection(COLLECTIONS.AVIS).updateMany(
+      { isRead: { $ne: true } },
+      { $set: { isRead: true, readAt: new Date().toISOString() } }
+    );
+    
+    console.log(`✅ ${result.modifiedCount} avis marqués comme lus`);
+    res.json({ success: true, count: result.modifiedCount });
+  } catch (error) {
+    console.error('Erreur marquage tous avis lus:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
@@ -2941,7 +3057,7 @@ async function generateInvoicePDF(invoiceData) {
 // Fonction pour envoyer une facture à Qonto
 async function attachInvoiceToQonto(invoicePDF, invoiceData) {
   try {
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     
     if (!settings?.qontoOrganizationId || !settings?.qontoSecretKey) {
       console.log('⚠️ Qonto non configuré - facture non attachée');
@@ -3207,7 +3323,7 @@ app.post('/api/qonto/retry-pending', authenticateToken, async (req, res) => {
 // Statut de l'intégration Qonto
 app.get('/api/qonto/status', async (req, res) => {
   try {
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     
     if (!settings?.qontoOrganizationId) {
       return res.json({ 
@@ -3382,7 +3498,7 @@ app.post('/api/subscription/payment-failed', async (req, res) => {
       );
       
       // Envoyer notification de blocage
-      const settings = await db.collection('settings').findOne({});
+      const settings = await getSettings();
       
       // Email de blocage
       try {
@@ -3645,7 +3761,7 @@ app.post('/api/subscription/process-payments', async (req, res) => {
     const { apiKey } = req.body;
     
     // Vérifier la clé API (sécurité basique pour le cron)
-    const settings = await db.collection('settings').findOne({});
+    const settings = await getSettings();
     if (apiKey !== settings?.cronApiKey && apiKey !== 'UCO_CRON_2024') {
       return res.status(401).json({ success: false, error: 'Non autorisé' });
     }
