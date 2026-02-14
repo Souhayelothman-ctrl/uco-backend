@@ -190,6 +190,7 @@ const COLLECTIONS = {
   COLLECTORS: 'collectors',
   OPERATORS: 'operators',
   RESTAURANTS: 'restaurants',
+  PRESTATAIRES: 'prestataires',
   COLLECTIONS: 'collections',
   TOURNEES: 'tournees',
   AUDIT_LOGS: 'auditLogs',
@@ -2979,6 +2980,218 @@ app.post('/api/stripe/customer-portal', async (req, res) => {
   } catch (error) {
     console.error('Erreur portail client:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =============================================
+// GESTION DES PRESTATAIRES DE SERVICES
+// =============================================
+
+// Liste des services disponibles
+const SERVICES_DISPONIBLES = [
+  { id: 'bac_graisse', name: 'Entretien bac à graisse', icon: '🪣' },
+  { id: 'hotte', name: 'Nettoyage hotte aspiration', icon: '🌀' },
+  { id: 'extincteur', name: 'Installation extincteurs', icon: '🧯' },
+  { id: 'deratisation', name: 'Dératisation', icon: '🐀' },
+  { id: 'haccp', name: 'Formation HACCP', icon: '📋' },
+  { id: 'frigoriste', name: 'Frigoriste', icon: '❄️' },
+  { id: 'matieres_premieres', name: 'Livraison matières premières', icon: '🛒' },
+  { id: 'comptable', name: 'Expert-comptable', icon: '📊' },
+  { id: 'avocat', name: 'Avocat', icon: '⚖️' },
+  { id: 'assurance', name: 'Assurance', icon: '🛡️' },
+  { id: 'electricien', name: 'Électricien', icon: '⚡' },
+  { id: 'plombier', name: 'Plombier', icon: '🔧' },
+  { id: 'nettoyage', name: 'Nettoyage professionnel', icon: '🧹' },
+  { id: 'securite', name: 'Sécurité incendie', icon: '🔥' },
+  { id: 'autre', name: 'Autre service', icon: '📦' }
+];
+
+// GET - Liste des services disponibles
+app.get('/api/services-disponibles', (req, res) => {
+  res.json(SERVICES_DISPONIBLES);
+});
+
+// GET - Liste des prestataires
+app.get('/api/prestataires', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const prestataires = await db.collection(COLLECTIONS.PRESTATAIRES).find({}).toArray();
+    res.json(prestataires || []);
+  } catch (error) {
+    console.error('Erreur récupération prestataires:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// GET - Un prestataire par ID
+app.get('/api/prestataires/:id', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    const { id } = req.params;
+    const prestataire = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({
+      $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }]
+    });
+    if (!prestataire) {
+      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
+    }
+    res.json(prestataire);
+  } catch (error) {
+    console.error('Erreur récupération prestataire:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// POST - Créer un prestataire
+app.post('/api/prestataires', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const data = sanitizeObject(req.body);
+    
+    // Validation des champs obligatoires
+    if (!data.enseigne) {
+      return res.status(400).json({ success: false, error: 'Enseigne requise' });
+    }
+    if (!data.email) {
+      return res.status(400).json({ success: false, error: 'Email requis' });
+    }
+    if (!data.services || data.services.length === 0) {
+      return res.status(400).json({ success: false, error: 'Au moins un service requis' });
+    }
+    
+    // Vérifier si le SIRET existe déjà
+    if (data.siret && data.siret !== 'EN_COURS') {
+      const existingBySiret = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ siret: data.siret });
+      if (existingBySiret) {
+        return res.status(409).json({ success: false, error: 'Un prestataire avec ce SIRET existe déjà' });
+      }
+    }
+    
+    // Vérifier si l'email existe déjà
+    const existingByEmail = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ email: data.email });
+    if (existingByEmail) {
+      return res.status(409).json({ success: false, error: 'Un prestataire avec cet email existe déjà' });
+    }
+    
+    // Générer un ID unique
+    const prestataireId = 'PREST_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    
+    const newPrestataire = {
+      ...data,
+      id: prestataireId,
+      _id: prestataireId,
+      dateCreation: new Date().toISOString(),
+      status: 'active',
+      createdBy: req.body.createdBy || 'admin'
+    };
+    
+    await db.collection(COLLECTIONS.PRESTATAIRES).insertOne(newPrestataire);
+    
+    console.log('✅ Nouveau prestataire créé:', prestataireId, '-', data.enseigne);
+    
+    await auditLog('PRESTATAIRE_CREATE', prestataireId, { 
+      enseigne: data.enseigne, 
+      services: data.services 
+    }, req);
+    
+    res.status(201).json({ success: true, id: prestataireId, prestataire: newPrestataire });
+    
+  } catch (error) {
+    console.error('Erreur création prestataire:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// PUT - Mettre à jour un prestataire
+app.put('/api/prestataires/:id', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const { id } = req.params;
+    const data = sanitizeObject(req.body);
+    
+    // Supprimer _id pour éviter les conflits
+    delete data._id;
+    
+    data.updatedAt = new Date().toISOString();
+    
+    const result = await db.collection(COLLECTIONS.PRESTATAIRES).updateOne(
+      { $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }] },
+      { $set: data }
+    );
+    
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
+    }
+    
+    console.log('✅ Prestataire mis à jour:', id);
+    
+    await auditLog('PRESTATAIRE_UPDATE', id, { fields: Object.keys(data) }, req);
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('Erreur mise à jour prestataire:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// DELETE - Supprimer un prestataire
+app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const { id } = req.params;
+    
+    const result = await db.collection(COLLECTIONS.PRESTATAIRES).deleteOne({
+      $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }]
+    });
+    
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
+    }
+    
+    console.log('✅ Prestataire supprimé:', id);
+    
+    await auditLog('PRESTATAIRE_DELETE', id, {}, req);
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('Erreur suppression prestataire:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// GET - Prestataires par service
+app.get('/api/prestataires/service/:serviceId', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const { serviceId } = req.params;
+    
+    const prestataires = await db.collection(COLLECTIONS.PRESTATAIRES).find({
+      services: sanitizeInput(serviceId),
+      status: 'active'
+    }).toArray();
+    
+    res.json(prestataires || []);
+    
+  } catch (error) {
+    console.error('Erreur récupération prestataires par service:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
 
