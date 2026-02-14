@@ -103,9 +103,24 @@ app.use('/api/password-reset', strictLimiter);
 // 4. Trust proxy (requis pour Render et le rate limiting)
 app.set('trust proxy', 1);
 
-// 5. Body parser avec limite
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// 5. Body parser avec limite - EXCLURE le webhook Stripe qui a besoin du body raw
+// IMPORTANT: Le webhook Stripe doit recevoir le body brut pour la vérification de signature Stripe
+
+app.use((req, res, next) => {
+  // Le webhook Stripe est géré séparément avec express.raw()
+  if (req.originalUrl === '/api/stripe/webhook') {
+    express.raw({ type: 'application/json' })(req, res, next);
+  } else {
+    express.json({ limit: '10mb' })(req, res, next);
+  }
+});
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/stripe/webhook') {
+    next();
+  } else {
+    express.urlencoded({ extended: true, limit: '10mb' })(req, res, next);
+  }
+});
 
 // 6. Sanitization contre les injections NoSQL
 app.use(mongoSanitize({
@@ -2414,21 +2429,26 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
 });
 
 // Webhook Stripe pour les événements de paiement
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Note: express.raw() est appliqué dans le middleware global pour cette route
+app.post('/api/stripe/webhook', async (req, res) => {
   try {
     const settings = await getSettings();
     if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) {
+      console.log('❌ Webhook: Stripe non configuré');
       return res.status(400).json({ error: 'Stripe non configuré' });
     }
     
     const stripe = require('stripe')(settings.stripeSecretKey);
     const sig = req.headers['stripe-signature'];
     
+    // Vérifier que le body est bien un Buffer
+    console.log('📥 Webhook body type:', typeof req.body, Buffer.isBuffer(req.body) ? '(Buffer)' : '(Not Buffer)');
+    
     let event;
     try {
       event = stripe.webhooks.constructEvent(req.body, sig, settings.stripeWebhookSecret);
     } catch (err) {
-      console.error('Erreur signature webhook:', err.message);
+      console.error('❌ Erreur signature webhook:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
     
@@ -2438,28 +2458,51 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
-        const { restaurantId, siret, plan } = session.metadata;
-        const identifier = restaurantId || siret;
+        const { restaurantId, siret, plan } = session.metadata || {};
+        
+        console.log('📋 Metadata reçues:', { restaurantId, siret, plan });
+        console.log('📋 Session customer:', session.customer);
+        console.log('📋 Session subscription:', session.subscription);
+        
+        if (!restaurantId && !siret) {
+          console.error('❌ Aucun identifiant restaurant dans les metadata');
+          break;
+        }
         
         // Récupérer les infos du payment method
         let cardLast4 = '****';
-        if (session.payment_method_types?.includes('card') && session.subscription) {
+        if (session.subscription) {
           try {
             const subscription = await stripe.subscriptions.retrieve(session.subscription);
             if (subscription.default_payment_method) {
               const pm = await stripe.paymentMethods.retrieve(subscription.default_payment_method);
               cardLast4 = pm.card?.last4 || '****';
             }
-          } catch (e) { console.log('Impossible de récupérer la carte:', e.message); }
+          } catch (e) { console.log('⚠️ Impossible de récupérer la carte:', e.message); }
         }
         
+        // Rechercher le restaurant avec plusieurs critères
+        const searchCriteria = [];
+        if (restaurantId) {
+          searchCriteria.push({ id: restaurantId });
+          searchCriteria.push({ qrCode: restaurantId });
+        }
+        if (siret) {
+          searchCriteria.push({ siret: siret });
+        }
+        if (session.customer_email) {
+          searchCriteria.push({ email: session.customer_email });
+        }
+        
+        console.log('🔍 Recherche restaurant avec:', JSON.stringify(searchCriteria));
+        
         // Mettre à jour l'abonnement du restaurant
-        await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-          { $or: [{ id: identifier }, { siret: identifier }] },
+        const updateResult = await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
+          { $or: searchCriteria },
           {
             $set: {
               subscription: {
-                plan,
+                plan: plan || 'simple',
                 status: 'active',
                 stripeCustomerId: session.customer,
                 stripeSubscriptionId: session.subscription,
@@ -2477,16 +2520,23 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           }
         );
         
-        console.log(`✅ Abonnement ${plan} activé pour: ${identifier}`);
+        console.log('📊 Résultat mise à jour:', { matched: updateResult.matchedCount, modified: updateResult.modifiedCount });
         
-        // Envoyer email de confirmation
-        const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({
-          $or: [{ id: identifier }, { siret: identifier }]
-        });
+        if (updateResult.matchedCount === 0) {
+          console.error('❌ Aucun restaurant trouvé avec les critères:', searchCriteria);
+        } else {
+          console.log(`✅ Abonnement ${plan} activé pour: ${restaurantId || siret}`);
+        }
+        
+        // Récupérer le restaurant mis à jour pour les notifications
+        const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ $or: searchCriteria });
         
         if (restaurant) {
+          const PLANS = { starter: 'Starter', simple: 'Simple', premium: 'Premium' };
+          const PRICES = { starter: 0, simple: 14.99, premium: 19.99 };
+          
+          // Email au restaurant
           try {
-            const PLANS = { starter: 'Starter', simple: 'Simple', premium: 'Premium' };
             const emailHtml = `
               <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
                 <div style="background:#6bb44a;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
@@ -2494,13 +2544,17 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
                 </div>
                 <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
                   <p>Bonjour,</p>
-                  <p>Votre abonnement <strong>${PLANS[plan]}</strong> est maintenant actif !</p>
+                  <p>Votre abonnement <strong>${PLANS[plan] || 'Simple'}</strong> est maintenant actif !</p>
                   <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:15px;margin:20px 0;">
-                    <p style="margin:5px 0;"><strong>Formule :</strong> ${PLANS[plan]}</p>
+                    <p style="margin:5px 0;"><strong>Formule :</strong> ${PLANS[plan] || 'Simple'}</p>
+                    <p style="margin:5px 0;"><strong>Prix :</strong> ${PRICES[plan] || 14.99}€/mois TTC</p>
                     <p style="margin:5px 0;"><strong>Carte :</strong> **** **** **** ${cardLast4}</p>
                     <p style="margin:5px 0;"><strong>Prélèvement :</strong> Mensuel automatique</p>
                   </div>
-                  <p>Vous pouvez dès maintenant profiter de tous vos services partenaires.</p>
+                  <p>Vous pouvez dès maintenant profiter de tous vos services partenaires en vous connectant à votre espace.</p>
+                  <p style="text-align:center;margin:20px 0;">
+                    <a href="https://uco-and-co.fr" style="background:#6bb44a;color:white;padding:12px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">Accéder à mon espace</a>
+                  </p>
                   <p>L'équipe UCO AND CO</p>
                 </div>
               </div>
@@ -2511,11 +2565,82 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 to: restaurant.email,
-                subject: `🎉 Abonnement ${PLANS[plan]} activé - UCO AND CO`,
+                subject: `🎉 Abonnement ${PLANS[plan] || 'Simple'} activé - UCO AND CO`,
                 htmlContent: emailHtml
               })
             });
-          } catch (e) { console.error('Erreur email confirmation:', e); }
+            console.log('✅ Email confirmation envoyé à:', restaurant.email);
+          } catch (e) { console.error('❌ Erreur email confirmation:', e.message); }
+          
+          // SMS au restaurant
+          if (settings.smsEnabled && restaurant.tel) {
+            try {
+              const telNumber = typeof restaurant.tel === 'object' 
+                ? `+${restaurant.tel.countryCode === 'FR' ? '33' : restaurant.tel.countryCode}${restaurant.tel.number.replace(/^0/, '')}`
+                : restaurant.tel;
+              
+              await fetch(`http://localhost:${PORT}/api/send-sms`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  to: telNumber,
+                  message: `UCO AND CO: Votre abonnement ${PLANS[plan] || 'Simple'} est activé ! Accédez à vos services: https://uco-and-co.fr`
+                })
+              });
+              console.log('✅ SMS confirmation envoyé');
+            } catch (e) { console.error('❌ Erreur SMS:', e.message); }
+          }
+          
+          // Email au superviseur
+          try {
+            const adminEmailHtml = `
+              <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+                <div style="background:#6bb44a;padding:20px;text-align:center;border-radius:10px 10px 0 0;">
+                  <h1 style="color:white;margin:0;">💰 Nouvel abonnement !</h1>
+                </div>
+                <div style="background:#f9f9f9;padding:30px;border-radius:0 0 10px 10px;">
+                  <p>Un nouveau restaurant vient de souscrire un abonnement :</p>
+                  <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:15px;margin:20px 0;">
+                    <p style="margin:5px 0;"><strong>Restaurant :</strong> ${restaurant.enseigne}</p>
+                    <p style="margin:5px 0;"><strong>SIRET :</strong> ${restaurant.siret || '-'}</p>
+                    <p style="margin:5px 0;"><strong>Email :</strong> ${restaurant.email}</p>
+                    <p style="margin:5px 0;"><strong>Formule :</strong> ${PLANS[plan] || 'Simple'}</p>
+                    <p style="margin:5px 0;"><strong>Prix :</strong> ${PRICES[plan] || 14.99}€/mois TTC</p>
+                  </div>
+                </div>
+              </div>
+            `;
+            
+            await fetch(`http://localhost:${PORT}/api/send-email`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                to: settings.email,
+                subject: `💰 Nouvel abonnement ${PLANS[plan] || 'Simple'} - ${restaurant.enseigne}`,
+                htmlContent: adminEmailHtml
+              })
+            });
+            console.log('✅ Email admin envoyé');
+          } catch (e) { console.error('❌ Erreur email admin:', e.message); }
+          
+          // SMS au superviseur
+          if (settings.smsEnabled && settings.adminTel) {
+            try {
+              const adminTelNumber = typeof settings.adminTel === 'object' 
+                ? `+33${settings.adminTel.number.replace(/^0/, '')}`
+                : settings.adminTel;
+              
+              await fetch(`http://localhost:${PORT}/api/send-sms`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  to: adminTelNumber,
+                  message: `UCO AND CO: Nouvel abonnement ${PLANS[plan] || 'Simple'} - ${restaurant.enseigne} (${PRICES[plan] || 14.99}€/mois)`
+                })
+              });
+              console.log('✅ SMS admin envoyé');
+            } catch (e) { console.error('❌ Erreur SMS admin:', e.message); }
+          }
         }
         
         break;
