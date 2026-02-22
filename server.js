@@ -210,6 +210,7 @@ const COLLECTIONS = {
   SESSIONS: 'sessions',
   DOCUMENTS: 'documents',
   CAMPAIGNS: 'campaigns',
+  TOURNEES_EN_COURS: 'tournees_en_cours',
   AVIS: 'avis'
 };
 
@@ -257,6 +258,8 @@ async function connectDB() {
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ timestamp: -1 });
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ action: 1 });
       await db.collection(COLLECTIONS.SESSIONS).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+      //Index pour tournées en cours (synchronisation multi-appareils)
+      await db.collection(COLLECTIONS.TOURNEES_EN_COURS).createIndex({ collectorEmail: 1 }, { unique: true });
     } catch (indexError) {
       console.warn('⚠️ Erreur création index:', indexError.message);
     }
@@ -976,7 +979,146 @@ app.post('/api/test-email', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+// =============================================
+// TOURNÉES EN COURS - SYNCHRONISATION MULTI-APPAREILS
+// =============================================
 
+/**
+ * GET /api/tournees/en-cours/:email
+ * Récupère la tournée en cours d'un collecteur
+ */
+app.get('/api/tournees/en-cours/:email', async (req, res) => {
+  try {
+    if (!db || !isConnected) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const email = decodeURIComponent(req.params.email);
+    console.log(`📱 [SYNC] Recherche tournée en cours pour: ${email}`);
+    
+    const tournee = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).findOne({ 
+      collectorEmail: email,
+      active: true,
+      dateFin: null
+    });
+    
+    if (tournee) {
+      console.log(`✅ [SYNC] Tournée trouvée: ${tournee.id}, collectes: ${tournee.collectes?.length || 0}`);
+      const { _id, ...tourneeData } = tournee;
+      return res.json(tourneeData);
+    }
+    
+    console.log(`ℹ️ [SYNC] Pas de tournée en cours pour: ${email}`);
+    return res.json(null);
+    
+  } catch (error) {
+    console.error('❌ Erreur GET tournee en cours:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
+  }
+});
+
+/**
+ * POST /api/tournees/en-cours
+ * Sauvegarde/met à jour une tournée en cours
+ */
+app.post('/api/tournees/en-cours', async (req, res) => {
+  try {
+    if (!db || !isConnected) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const tourneeData = sanitizeObject(req.body);
+    
+    if (!tourneeData.collectorEmail) {
+      return res.status(400).json({ success: false, error: 'collectorEmail requis' });
+    }
+    
+    tourneeData.lastUpdate = new Date().toISOString();
+    
+    console.log(`💾 [SYNC] Sauvegarde tournée: ${tourneeData.id}, collectes: ${tourneeData.collectes?.length || 0}`);
+    
+    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
+      { collectorEmail: tourneeData.collectorEmail },
+      { $set: { ...tourneeData, _id: tourneeData.collectorEmail } },
+      { upsert: true }
+    );
+    
+    console.log(`✅ [SYNC] Tournée sauvegardée`);
+    res.json({ success: true, tourneeId: tourneeData.id });
+    
+  } catch (error) {
+    console.error('❌ Erreur POST tournee en cours:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
+  }
+});
+
+/**
+ * DELETE /api/tournees/en-cours/:email
+ * Supprime la tournée en cours (quand terminée)
+ */
+app.delete('/api/tournees/en-cours/:email', async (req, res) => {
+  try {
+    if (!db || !isConnected) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const email = decodeURIComponent(req.params.email);
+    console.log(`🗑️ [SYNC] Suppression tournée pour: ${email}`);
+    
+    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteOne({ collectorEmail: email });
+    
+    console.log(`✅ [SYNC] Supprimé: ${result.deletedCount > 0}`);
+    return res.json({ success: true, deleted: result.deletedCount > 0 });
+    
+  } catch (error) {
+    console.error('❌ Erreur DELETE tournee en cours:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
+  }
+});
+
+/**
+ * POST /api/tournees/paused
+ * Sauvegarde une tournée mise en pause
+ */
+app.post('/api/tournees/paused', async (req, res) => {
+  try {
+    if (!db || !isConnected) {
+      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    }
+    
+    const tourneeData = sanitizeObject(req.body);
+    
+    if (!tourneeData.collectorEmail) {
+      return res.status(400).json({ success: false, error: 'collectorEmail requis' });
+    }
+    
+    console.log(`⏸️ [SYNC] Pause tournée pour: ${tourneeData.collectorEmail}`);
+    
+    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
+      { collectorEmail: tourneeData.collectorEmail },
+      { 
+        $set: {
+          ...tourneeData,
+          _id: tourneeData.collectorEmail,
+          isPaused: true,
+          status: 'paused',
+          pausedAt: new Date().toISOString(),
+          lastUpdate: new Date().toISOString()
+        }
+      },
+      { upsert: true }
+    );
+    
+    console.log(`✅ [SYNC] Tournée en pause sauvegardée`);
+    res.json({ success: true, tourneeId: tourneeData.id });
+    
+  } catch (error) {
+    console.error('❌ Erreur POST tournee paused:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
+  }
+});
+
+// ===== FIN ROUTES SYNCHRONISATION =====
 // ===== AUTHENTIFICATION SÉCURISÉE =====
 app.post('/api/auth/admin', async (req, res) => {
   try {
