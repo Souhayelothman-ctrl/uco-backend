@@ -339,6 +339,9 @@ app.use('/api/settings', checkDBConnection);
 app.use('/api/auth', checkDBConnection);
 app.use('/api/prestataires', checkDBConnection);
 app.use('/api/avis', checkDBConnection);
+// Routes Stripe Webhook
+const stripeWebhook = require('./routes/stripe-webhook');
+app.use('/api/stripe', stripeWebhook);
 
 process.on('SIGINT', async () => {
   console.log('\n🛑 Arrêt du serveur (SIGINT)...');
