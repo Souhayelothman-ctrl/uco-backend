@@ -343,6 +343,9 @@ app.use('/api/avis', checkDBConnection);
 // Routes Stripe Webhook
 const stripeWebhook = require('./routes/stripe-webhook');
 app.use('/api/stripe', stripeWebhook);
+// Routes demandes de collecte (urgences)
+const demandesCollecteRoutes = require('./routes/demandes-collecte');
+app.use('/api/demandes-collecte', demandesCollecteRoutes);
 
 process.on('SIGINT', async () => {
   console.log('\n🛑 Arrêt du serveur (SIGINT)...');
