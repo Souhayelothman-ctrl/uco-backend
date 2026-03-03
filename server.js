@@ -1614,17 +1614,21 @@ app.get('/api/collections', async (req, res) => {
     // Mode léger: exclure les signatures base64 (économise ~80% de mémoire)
     const projection = { 
       colSignature: 0, 
-      restoSignature: 0,
-      'restaurant.signatures': 0,
-      'restaurant.contratPDF': 0
+      restoSignature: 0
     };
     
     const collections = await db.collection(COLLECTIONS.COLLECTIONS)
       .find({}, { projection })
-      .sort({ date: -1 })
+      .sort({ createdAt: -1 })
       .toArray();
     
-    res.json(collections);
+    // S'assurer que chaque collecte a un champ 'date' (le frontend l'utilise pour filtrer)
+    const collectionsWithDate = collections.map(c => ({
+      ...c,
+      date: c.date || c.createdAt
+    }));
+    
+    res.json(collectionsWithDate);
   } catch (e) {
     console.error('Erreur getCollections:', e.message);
     res.json([]);
