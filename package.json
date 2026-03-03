@@ -2,10 +2,10 @@
   "name": "uco-backend",
   "version": "2.3.0",
   "description": "Backend API sécurisé pour UCO AND CO - Collecte d'huiles usagées",
-  "main": "server-secure.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-secure.js",
-    "dev": "nodemon server-secure.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "engines": {
     "node": ">=18.0.0"
