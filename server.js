@@ -12,10 +12,9 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const fetch = require('node-fetch');
-
+const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3001;
-
 // =============================================
 // GESTION DES ERREURS GLOBALES - ANTI-CRASH
 // =============================================
@@ -24,12 +23,10 @@ process.on('uncaughtException', (err) => {
   console.error(err.stack);
   // NE PAS faire process.exit() - laisser le serveur tourner
 });
-
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ [UNHANDLED REJECTION]', reason);
   // NE PAS faire process.exit() - laisser le serveur tourner
 });
-
 // =============================================
 // CONFIGURATION SÉCURITÉ
 // =============================================
@@ -38,11 +35,9 @@ const JWT_EXPIRES_IN = '24h';
 const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_TIME = 15 * 60 * 1000;
-
 // =============================================
 // MIDDLEWARES DE SÉCURITÉ
 // =============================================
-
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -55,6 +50,18 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
+// =============================================
+// COMPRESSION GZIP - Réduit les réponses de 70-90%
+// =============================================
+app.use(compression({
+  level: 6,
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
+
 const allowedOrigins = [
   'https://uco-and-co.netlify.app',
   'https://uco-and-co.fr',
@@ -63,7 +70,6 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173'
 ].filter(Boolean);
-
 if (process.env.CORS_ORIGIN) {
   process.env.CORS_ORIGIN.split(',').forEach(origin => {
     if (origin && !allowedOrigins.includes(origin.trim())) {
@@ -71,7 +77,6 @@ if (process.env.CORS_ORIGIN) {
     }
   });
 }
-
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
@@ -86,7 +91,6 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID']
 }));
-
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 500,
@@ -95,7 +99,6 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
   skip: (req) => req.path === '/api/health' || (req.path === '/api/settings' && req.method === 'GET')
 });
-
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -103,22 +106,17 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-
 const strictLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
   message: { success: false, error: 'Limite atteinte, réessayez plus tard' },
 });
-
 app.use('/api/', generalLimiter);
 app.use('/api/auth/', authLimiter);
 app.use('/api/password-reset', strictLimiter);
-
 app.set('trust proxy', 1);
-
 app.use((req, res, next) => {
   if (req.originalUrl === '/api/stripe/webhook') {
-    // Pour Stripe: body brut en Buffer
     express.raw({ type: '*/*' })(req, res, next);
   } else {
     express.json({ limit: '10mb' })(req, res, next);
@@ -131,17 +129,14 @@ app.use((req, res, next) => {
     express.urlencoded({ extended: true, limit: '10mb' })(req, res, next);
   }
 });
-
 app.use(mongoSanitize({
   replaceWith: '_',
   onSanitize: ({ req, key }) => {
     console.warn(`🚫 Tentative d'injection NoSQL détectée: ${key}`);
   }
 }));
-
 app.use(xss());
 app.use(hpp());
-
 app.use((req, res, next) => {
   const requestId = uuidv4().slice(0, 8);
   req.requestId = requestId;
@@ -151,20 +146,16 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-ID', requestId);
   next();
 });
-
 // =============================================
 // CONFIGURATION MONGODB ATLAS - ROBUSTE
 // =============================================
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const DB_NAME = 'ucoandco';
-
 let db = null;
 let mongoClient = null;
 let isConnected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
-
-// Options de connexion robustes
 const mongoOptions = {
   maxPoolSize: 10,
   minPoolSize: 2,
@@ -175,7 +166,6 @@ const mongoOptions = {
   retryWrites: true,
   retryReads: true,
 };
-
 const initialData = {
   admin: {
     email: 'contact@uco-and-co.com',
@@ -198,7 +188,6 @@ const initialData = {
     }
   }
 };
-
 const COLLECTIONS = {
   SETTINGS: 'settings',
   COLLECTORS: 'collectors',
@@ -214,13 +203,11 @@ const COLLECTIONS = {
   TOURNEES_EN_COURS: 'tournees_en_cours',
   AVIS: 'avis'
 };
-
 const cache = {
   settings: null,
   lastSettingsUpdate: 0,
   TTL: 60000
 };
-
 // =============================================
 // CONNEXION MONGODB AVEC RECONNEXION AUTO
 // =============================================
@@ -229,7 +216,6 @@ async function connectDB() {
     console.warn('⚠️ MONGODB_URI non configurée - Mode mémoire uniquement');
     return false;
   }
-
   try {
     console.log('🔄 Connexion sécurisée à MongoDB Atlas...');
     mongoClient = new MongoClient(MONGODB_URI, mongoOptions);
@@ -259,7 +245,6 @@ async function connectDB() {
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ timestamp: -1 });
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ action: 1 });
       await db.collection(COLLECTIONS.SESSIONS).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-      //Index pour tournées en cours (synchronisation multi-appareils)
       await db.collection(COLLECTIONS.TOURNEES_EN_COURS).createIndex({ collectorEmail: 1 }, { unique: true });
     } catch (indexError) {
       console.warn('⚠️ Erreur création index:', indexError.message);
@@ -287,7 +272,6 @@ async function connectDB() {
     return false;
   }
 }
-
 function scheduleReconnect() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
     console.error('❌ Max tentatives de reconnexion atteint. Le serveur continue sans DB.');
@@ -313,7 +297,6 @@ function scheduleReconnect() {
     }
   }, delay);
 }
-
 function checkDBConnection(req, res, next) {
   if (req.path === '/api/health') {
     return next();
@@ -330,7 +313,6 @@ function checkDBConnection(req, res, next) {
   
   next();
 }
-
 app.use('/api/collectors', checkDBConnection);
 app.use('/api/operators', checkDBConnection);
 app.use('/api/restaurants', checkDBConnection);
@@ -346,7 +328,6 @@ app.use('/api/stripe', stripeWebhook);
 // Routes demandes de collecte (urgences)
 const demandesCollecteRoutes = require('./routes/demandes-collecte');
 app.use('/api/demandes-collecte', demandesCollecteRoutes);
-
 process.on('SIGINT', async () => {
   console.log('\n🛑 Arrêt du serveur (SIGINT)...');
   if (mongoClient) {
@@ -354,7 +335,6 @@ process.on('SIGINT', async () => {
   }
   process.exit(0);
 });
-
 process.on('SIGTERM', async () => {
   console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
   if (mongoClient) {
@@ -362,21 +342,17 @@ process.on('SIGTERM', async () => {
   }
   process.exit(0);
 });
-
 // =============================================
 // FONCTIONS UTILITAIRES DE SÉCURITÉ
 // =============================================
-
 function isValidEmail(email) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(email);
 }
-
 function isStrongPassword(password) {
   const strongRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
   return strongRegex.test(password);
 }
-
 function sanitizeInput(input, key = '') {
   if (typeof input !== 'string') return input;
   const unlimitedFields = ['restaurant', 'admin', 'collecteur', 'base64', 'content', 'data', 'signature', 'contrat', 'bordereau'];
@@ -384,7 +360,6 @@ function sanitizeInput(input, key = '') {
   const sanitized = input.replace(/[<>]/g, '').trim();
   return isUnlimited ? sanitized : sanitized.slice(0, 5000);
 }
-
 function sanitizeObject(obj, parentKey = '') {
   if (typeof obj !== 'object' || obj === null) {
     return sanitizeInput(obj, parentKey);
@@ -396,11 +371,9 @@ function sanitizeObject(obj, parentKey = '') {
   }
   return sanitized;
 }
-
 function generateToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
-
 function verifyToken(token) {
   try {
     return jwt.verify(token, JWT_SECRET);
@@ -408,7 +381,6 @@ function verifyToken(token) {
     return null;
   }
 }
-
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -422,7 +394,6 @@ function authenticateToken(req, res, next) {
   req.user = decoded;
   next();
 }
-
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user || !roles.includes(req.user.role)) {
@@ -431,7 +402,6 @@ function requireRole(...roles) {
     next();
   };
 }
-
 async function auditLog(action, userId, details, req) {
   if (!db || !isConnected) return;
   try {
@@ -449,12 +419,10 @@ async function auditLog(action, userId, details, req) {
     console.error('Erreur audit log:', error.message);
   }
 }
-
 function isAccountLocked(user) {
   if (!user.lockUntil) return false;
   return new Date(user.lockUntil) > new Date();
 }
-
 async function incrementLoginAttempts(collection, identifier) {
   if (!db || !isConnected) return;
   try {
@@ -468,7 +436,6 @@ async function incrementLoginAttempts(collection, identifier) {
     console.error('Erreur incrementLoginAttempts:', e.message);
   }
 }
-
 async function resetLoginAttempts(collection, identifier) {
   if (!db || !isConnected) return;
   try {
@@ -480,11 +447,9 @@ async function resetLoginAttempts(collection, identifier) {
     console.error('Erreur resetLoginAttempts:', e.message);
   }
 }
-
 // =============================================
 // FONCTIONS D'ACCÈS AUX DONNÉES
 // =============================================
-
 async function getSettings() {
   try {
     if (!db || !isConnected) return initialData.settings;
@@ -520,7 +485,6 @@ async function getSettings() {
     return initialData.settings;
   }
 }
-
 async function updateSettings(newSettings) {
   if (!db || !isConnected) return false;
   
@@ -573,6 +537,9 @@ async function updateSettings(newSettings) {
     cache.settings = null;
     cache.lastSettingsUpdate = 0;
     
+    // Invalider l'instance Stripe si les settings changent
+    stripeInstance = null;
+    
     console.log('✅ Settings mis à jour avec succès');
     return true;
   } catch (error) {
@@ -580,12 +547,10 @@ async function updateSettings(newSettings) {
     return false;
   }
 }
-
 async function getAdmin() {
   const settings = await getSettings();
   return settings.admin || initialData.admin;
 }
-
 // Collecteurs
 async function getCollectors(status = null) {
   if (!db || !isConnected) return [];
@@ -597,7 +562,6 @@ async function getCollectors(status = null) {
     return [];
   }
 }
-
 async function getCollectorByEmail(email) {
   if (!db || !isConnected) return null;
   try {
@@ -607,7 +571,6 @@ async function getCollectorByEmail(email) {
     return null;
   }
 }
-
 async function addCollector(collector) {
   if (!db || !isConnected) return null;
   try {
@@ -625,7 +588,6 @@ async function addCollector(collector) {
     return null;
   }
 }
-
 async function updateCollector(email, data) {
   if (!db || !isConnected) return false;
   try {
@@ -639,7 +601,6 @@ async function updateCollector(email, data) {
     return false;
   }
 }
-
 async function deleteCollector(email) {
   if (!db || !isConnected) return false;
   try {
@@ -650,7 +611,6 @@ async function deleteCollector(email) {
     return false;
   }
 }
-
 // Opérateurs
 async function getOperators(status = null) {
   if (!db || !isConnected) return [];
@@ -662,7 +622,6 @@ async function getOperators(status = null) {
     return [];
   }
 }
-
 async function getOperatorByEmail(email) {
   if (!db || !isConnected) return null;
   try {
@@ -672,7 +631,6 @@ async function getOperatorByEmail(email) {
     return null;
   }
 }
-
 async function addOperator(operator) {
   if (!db || !isConnected) return null;
   try {
@@ -690,7 +648,6 @@ async function addOperator(operator) {
     return null;
   }
 }
-
 async function updateOperator(email, data) {
   if (!db || !isConnected) return false;
   try {
@@ -704,7 +661,6 @@ async function updateOperator(email, data) {
     return false;
   }
 }
-
 async function deleteOperator(email) {
   if (!db || !isConnected) return false;
   try {
@@ -715,7 +671,6 @@ async function deleteOperator(email) {
     return false;
   }
 }
-
 // Restaurants
 async function getRestaurants(status = null) {
   if (!db || !isConnected) return [];
@@ -727,7 +682,6 @@ async function getRestaurants(status = null) {
     return [];
   }
 }
-
 async function getRestaurantById(id) {
   if (!db || !isConnected) return null;
   try {
@@ -744,7 +698,6 @@ async function getRestaurantById(id) {
     return null;
   }
 }
-
 async function getRestaurantByQRCode(qrCode) {
   if (!db || !isConnected) return null;
   try {
@@ -754,7 +707,6 @@ async function getRestaurantByQRCode(qrCode) {
     return null;
   }
 }
-
 async function getRestaurantByEmail(email) {
   if (!db || !isConnected) return null;
   try {
@@ -764,7 +716,6 @@ async function getRestaurantByEmail(email) {
     return null;
   }
 }
-
 async function addRestaurant(restaurant) {
   if (!db || !isConnected) return null;
   try {
@@ -782,7 +733,6 @@ async function addRestaurant(restaurant) {
     return null;
   }
 }
-
 async function updateRestaurant(id, data) {
   if (!db || !isConnected) return false;
   try {
@@ -797,7 +747,6 @@ async function updateRestaurant(id, data) {
     return false;
   }
 }
-
 async function deleteRestaurant(id) {
   if (!db || !isConnected) return false;
   try {
@@ -808,18 +757,7 @@ async function deleteRestaurant(id) {
     return false;
   }
 }
-
-// Collections
-async function getCollections() {
-  if (!db || !isConnected) return [];
-  try {
-    return await db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).toArray();
-  } catch (e) {
-    console.error('Erreur getCollections:', e.message);
-    return [];
-  }
-}
-
+// Collections - fonction interne (utilisée par addCollection)
 async function addCollection(collection) {
   if (!db || !isConnected) return null;
   try {
@@ -835,18 +773,7 @@ async function addCollection(collection) {
     return null;
   }
 }
-
-// Tournées
-async function getTournees() {
-  if (!db || !isConnected) return [];
-  try {
-    return await db.collection(COLLECTIONS.TOURNEES).find({}).sort({ dateDepart: -1 }).toArray();
-  } catch (e) {
-    console.error('Erreur getTournees:', e.message);
-    return [];
-  }
-}
-
+// Tournées - fonction interne
 async function addTournee(tournee) {
   if (!db || !isConnected) return null;
   try {
@@ -862,7 +789,6 @@ async function addTournee(tournee) {
     return null;
   }
 }
-
 async function updateTournee(id, data) {
   if (!db || !isConnected) return false;
   try {
@@ -876,7 +802,6 @@ async function updateTournee(id, data) {
     return false;
   }
 }
-
 // Numéros uniques
 async function generateCollectorNumber() {
   const collectors = await getCollectors('approved');
@@ -885,7 +810,6 @@ async function generateCollectorNumber() {
   while (existingNumbers.includes(num)) num++;
   return num;
 }
-
 async function generateOperatorNumber() {
   const operators = await getOperators('approved');
   const existingNumbers = operators.filter(o => o.operatorNumber).map(o => o.operatorNumber);
@@ -895,9 +819,20 @@ async function generateOperatorNumber() {
 }
 
 // =============================================
+// STRIPE - Instance unique (évite fuites mémoire)
+// =============================================
+let stripeInstance = null;
+async function getStripe() {
+  if (stripeInstance) return stripeInstance;
+  const settings = await getSettings();
+  if (!settings?.stripeSecretKey) return null;
+  stripeInstance = require('stripe')(settings.stripeSecretKey);
+  return stripeInstance;
+}
+
+// =============================================
 // ROUTES API
 // =============================================
-
 // ===== PROXY APIs GOUVERNEMENTALES =====
 app.get('/api/proxy/siret/:siret', async (req, res) => {
   try {
@@ -916,7 +851,6 @@ app.get('/api/proxy/siret/:siret', async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/proxy/villes/:cp', async (req, res) => {
   try {
     const cp = req.params.cp.replace(/\D/g, '');
@@ -934,8 +868,7 @@ app.get('/api/proxy/villes/:cp', async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-
-// Health check - TOUJOURS retourne 200
+// Health check
 app.get('/api/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
@@ -944,10 +877,10 @@ app.get('/api/health', (req, res) => {
     secure: true,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
     reconnectAttempts: reconnectAttempts
   });
 });
-
 // Test email
 app.post('/api/test-email', async (req, res) => {
   try {
@@ -989,118 +922,78 @@ app.post('/api/test-email', async (req, res) => {
 // =============================================
 // TOURNÉES EN COURS - SYNCHRONISATION MULTI-APPAREILS
 // =============================================
-
-/**
- * GET /api/tournees/en-cours/:email
- * Récupère la tournée en cours d'un collecteur
- */
 app.get('/api/tournees/en-cours/:email', async (req, res) => {
   try {
     if (!db || !isConnected) {
       return res.status(503).json({ success: false, error: 'Base de données non connectée' });
     }
-    
     const email = decodeURIComponent(req.params.email);
     console.log(`📱 [SYNC] Recherche tournée en cours pour: ${email}`);
-    
     const tournee = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).findOne({ 
       collectorEmail: email,
       active: true,
       dateFin: null
     });
-    
     if (tournee) {
       console.log(`✅ [SYNC] Tournée trouvée: ${tournee.id}, collectes: ${tournee.collectes?.length || 0}`);
       const { _id, ...tourneeData } = tournee;
       return res.json(tourneeData);
     }
-    
     console.log(`ℹ️ [SYNC] Pas de tournée en cours pour: ${email}`);
     return res.json(null);
-    
   } catch (error) {
     console.error('❌ Erreur GET tournee en cours:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
   }
 });
-
-/**
- * POST /api/tournees/en-cours
- * Sauvegarde/met à jour une tournée en cours
- */
 app.post('/api/tournees/en-cours', async (req, res) => {
   try {
     if (!db || !isConnected) {
       return res.status(503).json({ success: false, error: 'Base de données non connectée' });
     }
-    
     const tourneeData = sanitizeObject(req.body);
-    
     if (!tourneeData.collectorEmail) {
       return res.status(400).json({ success: false, error: 'collectorEmail requis' });
     }
-    
     tourneeData.lastUpdate = new Date().toISOString();
-    
     console.log(`💾 [SYNC] Sauvegarde tournée: ${tourneeData.id}, collectes: ${tourneeData.collectes?.length || 0}`);
-    
     const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
       { collectorEmail: tourneeData.collectorEmail },
       { $set: { ...tourneeData, _id: tourneeData.collectorEmail } },
       { upsert: true }
     );
-    
     console.log(`✅ [SYNC] Tournée sauvegardée`);
     res.json({ success: true, tourneeId: tourneeData.id });
-    
   } catch (error) {
     console.error('❌ Erreur POST tournee en cours:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
   }
 });
-
-/**
- * DELETE /api/tournees/en-cours/:email
- * Supprime la tournée en cours (quand terminée)
- */
 app.delete('/api/tournees/en-cours/:email', async (req, res) => {
   try {
     if (!db || !isConnected) {
       return res.status(503).json({ success: false, error: 'Base de données non connectée' });
     }
-    
     const email = decodeURIComponent(req.params.email);
     console.log(`🗑️ [SYNC] Suppression tournée pour: ${email}`);
-    
     const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteOne({ collectorEmail: email });
-    
     console.log(`✅ [SYNC] Supprimé: ${result.deletedCount > 0}`);
     return res.json({ success: true, deleted: result.deletedCount > 0 });
-    
   } catch (error) {
     console.error('❌ Erreur DELETE tournee en cours:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
   }
 });
-
-/**
- * POST /api/tournees/paused
- * Sauvegarde une tournée mise en pause
- */
 app.post('/api/tournees/paused', async (req, res) => {
   try {
     if (!db || !isConnected) {
       return res.status(503).json({ success: false, error: 'Base de données non connectée' });
     }
-    
     const tourneeData = sanitizeObject(req.body);
-    
     if (!tourneeData.collectorEmail) {
       return res.status(400).json({ success: false, error: 'collectorEmail requis' });
     }
-    
     console.log(`⏸️ [SYNC] Pause tournée pour: ${tourneeData.collectorEmail}`);
-    
     const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
       { collectorEmail: tourneeData.collectorEmail },
       { 
@@ -1115,17 +1008,13 @@ app.post('/api/tournees/paused', async (req, res) => {
       },
       { upsert: true }
     );
-    
     console.log(`✅ [SYNC] Tournée en pause sauvegardée`);
     res.json({ success: true, tourneeId: tourneeData.id });
-    
   } catch (error) {
     console.error('❌ Erreur POST tournee paused:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
   }
 });
-
-// ===== FIN ROUTES SYNCHRONISATION =====
 // ===== AUTHENTIFICATION SÉCURISÉE =====
 app.post('/api/auth/admin', async (req, res) => {
   try {
@@ -1155,7 +1044,6 @@ app.post('/api/auth/admin', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/auth/collector', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
@@ -1196,7 +1084,6 @@ app.post('/api/auth/collector', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/auth/operator', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
@@ -1232,7 +1119,6 @@ app.post('/api/auth/operator', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/auth/restaurant', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
@@ -1243,13 +1129,6 @@ app.post('/api/auth/restaurant', async (req, res) => {
     }
     const restaurant = await getRestaurantByEmail(email);
     console.log('Restaurant trouvé:', restaurant ? 'Oui' : 'Non');
-    if (restaurant) {
-      console.log('- ID:', restaurant.id);
-      console.log('- Status:', restaurant.status);
-      console.log('- Has password:', !!restaurant.password);
-      console.log('- Has tempPassword:', !!restaurant.tempPassword);
-      console.log('- CreatedBy:', restaurant.createdBy);
-    }
     if (!restaurant) {
       return res.status(401).json({ success: false, error: 'Compte non trouvé' });
     }
@@ -1273,7 +1152,6 @@ app.post('/api/auth/restaurant', async (req, res) => {
     if (restaurant.password) {
       try {
         isValid = await bcrypt.compare(password, restaurant.password);
-        console.log('Vérification mot de passe hashé:', isValid);
       } catch (bcryptError) {
         console.error('Erreur bcrypt:', bcryptError);
       }
@@ -1281,7 +1159,6 @@ app.post('/api/auth/restaurant', async (req, res) => {
     if (!isValid && restaurant.tempPassword) {
       isValid = (password === restaurant.tempPassword);
       usedTempPassword = isValid;
-      console.log('Vérification mot de passe provisoire:', isValid);
     }
     if (!isValid) {
       await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
@@ -1289,13 +1166,11 @@ app.post('/api/auth/restaurant', async (req, res) => {
     }
     if (!restaurant.status && (restaurant.tempPassword || restaurant.createdBy === 'admin')) {
       await updateRestaurant(restaurant.id, { status: 'approved' });
-      console.log('Status mis à jour vers approved pour:', restaurant.id);
     }
     await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
     const token = generateToken({ role: 'restaurant', email, id: restaurant.id });
     const { password: _, tempPassword: __, loginAttempts, lockUntil, ...data } = restaurant;
     await auditLog('RESTAURANT_LOGIN_SUCCESS', email, { usedTempPassword }, req);
-    console.log('Connexion réussie pour:', email);
     res.json({ 
       success: true, 
       role: 'restaurant', 
@@ -1307,11 +1182,9 @@ app.post('/api/auth/restaurant', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/auth/verify', authenticateToken, (req, res) => {
   res.json({ success: true, user: req.user });
 });
-
 // ===== COLLECTEURS =====
 app.post('/api/collectors/register', async (req, res) => {
   try {
@@ -1343,17 +1216,14 @@ app.post('/api/collectors/register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/collectors/pending', async (req, res) => {
   const collectors = await getCollectors('pending');
   res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
 });
-
 app.get('/api/collectors/approved', async (req, res) => {
   const collectors = await getCollectors('approved');
   res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
 });
-
 app.post('/api/collectors/:email/approve', async (req, res) => {
   try {
     const { email } = req.params;
@@ -1369,21 +1239,18 @@ app.post('/api/collectors/:email/approve', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/collectors/:email/reject', async (req, res) => {
   const { email } = req.params;
   await deleteCollector(email);
   await auditLog('COLLECTOR_REJECTED', email, {}, req);
   res.json({ success: true });
 });
-
 app.delete('/api/collectors/:email', async (req, res) => {
   const { email } = req.params;
   await deleteCollector(email);
   await auditLog('COLLECTOR_DELETED', email, {}, req);
   res.json({ success: true });
 });
-
 // ===== OPÉRATEURS =====
 app.post('/api/operators/register', async (req, res) => {
   try {
@@ -1408,17 +1275,14 @@ app.post('/api/operators/register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/operators/pending', async (req, res) => {
   const operators = await getOperators('pending');
   res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
 });
-
 app.get('/api/operators/approved', async (req, res) => {
   const operators = await getOperators('approved');
   res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
 });
-
 app.post('/api/operators/:email/approve', async (req, res) => {
   const { email } = req.params;
   const operatorNumber = await generateOperatorNumber();
@@ -1430,20 +1294,17 @@ app.post('/api/operators/:email/approve', async (req, res) => {
   await auditLog('OPERATOR_APPROVED', email, { operatorNumber }, req);
   res.json({ success: true, operatorNumber });
 });
-
 app.post('/api/operators/:email/reject', async (req, res) => {
   const { email } = req.params;
   await deleteOperator(email);
   await auditLog('OPERATOR_REJECTED', email, {}, req);
   res.json({ success: true });
 });
-
 app.delete('/api/operators/:email', async (req, res) => {
   const { email } = req.params;
   await deleteOperator(email);
   res.json({ success: true });
 });
-
 // ===== RESTAURANTS =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
@@ -1547,16 +1408,35 @@ app.post('/api/restaurants/register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/restaurants/pending', async (req, res) => {
   const restaurants = await getRestaurants('pending');
   res.json(restaurants.map(({ password, loginAttempts, lockUntil, ...r }) => r));
 });
 
+// =============================================
+// [OPTIMISÉ] GET /api/restaurants - Exclure champs lourds (signatures, PDFs)
+// =============================================
 app.get('/api/restaurants', async (req, res) => {
-  const all = await getRestaurants();
-  const filtered = all.filter(r => r.status === 'approved' || r.status === 'terminated');
-  res.json(filtered.map(({ password, loginAttempts, lockUntil, ...r }) => r));
+  try {
+    if (!db || !isConnected) return res.json([]);
+    
+    const restaurants = await db.collection(COLLECTIONS.RESTAURANTS)
+      .find(
+        { status: { $in: ['approved', 'terminated'] } },
+        { projection: { 
+          password: 0, 
+          loginAttempts: 0, 
+          lockUntil: 0,
+          contratPDF: 0
+        }}
+      )
+      .toArray();
+    
+    res.json(restaurants);
+  } catch (e) {
+    console.error('Erreur getRestaurants:', e.message);
+    res.json([]);
+  }
 });
 
 app.get('/api/restaurants/qr/:qrCode', async (req, res) => {
@@ -1567,7 +1447,6 @@ app.get('/api/restaurants/qr/:qrCode', async (req, res) => {
   const { password, loginAttempts, lockUntil, ...data } = restaurant;
   res.json(data);
 });
-
 app.get('/api/restaurants/siret/:siret', async (req, res) => {
   const siret = req.params.siret.replace(/\D/g, '');
   if (siret.length !== 14) {
@@ -1583,7 +1462,6 @@ app.get('/api/restaurants/siret/:siret', async (req, res) => {
   const { password, loginAttempts, lockUntil, ...data } = restaurant;
   res.json({ ...data, exists: true });
 });
-
 app.post('/api/restaurants/:id/terminate', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1605,7 +1483,6 @@ app.post('/api/restaurants/:id/terminate', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/restaurants/:id/approve', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1630,14 +1507,12 @@ app.post('/api/restaurants/:id/approve', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/restaurants/:id/reject', async (req, res) => {
   const { id } = req.params;
   await deleteRestaurant(id);
   await auditLog('RESTAURANT_REJECTED', id, {}, req);
   res.json({ success: true });
 });
-
 app.post('/api/restaurants', async (req, res) => {
   try {
     const { id, qrCode, ...data } = sanitizeObject(req.body);
@@ -1659,7 +1534,6 @@ app.post('/api/restaurants', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.put('/api/restaurants/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1674,7 +1548,6 @@ app.put('/api/restaurants/:id', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.put('/api/restaurants/:id/password', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1693,7 +1566,6 @@ app.put('/api/restaurants/:id/password', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/restaurants/:id/change-password', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1732,10 +1604,47 @@ app.post('/api/restaurants/:id/change-password', async (req, res) => {
   }
 });
 
-// ===== COLLECTES =====
+// =============================================
+// [OPTIMISÉ] COLLECTES - avec mode léger (sans signatures base64)
+// =============================================
 app.get('/api/collections', async (req, res) => {
-  const collections = await getCollections();
-  res.json(collections);
+  try {
+    if (!db || !isConnected) return res.json([]);
+    
+    // Mode léger: exclure les signatures base64 (économise ~80% de mémoire)
+    const projection = { 
+      colSignature: 0, 
+      restoSignature: 0,
+      'restaurant.signatures': 0,
+      'restaurant.contratPDF': 0
+    };
+    
+    const collections = await db.collection(COLLECTIONS.COLLECTIONS)
+      .find({}, { projection })
+      .sort({ date: -1 })
+      .toArray();
+    
+    res.json(collections);
+  } catch (e) {
+    console.error('Erreur getCollections:', e.message);
+    res.json([]);
+  }
+});
+
+// Route pour récupérer une collecte spécifique AVEC signatures (quand on en a besoin)
+app.get('/api/collections/:id', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectée' });
+    const { id } = req.params;
+    const collection = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ 
+      $or: [{ _id: sanitizeInput(id) }, { id: sanitizeInput(id) }] 
+    });
+    if (!collection) return res.status(404).json({ error: 'Collecte non trouvée' });
+    res.json(collection);
+  } catch (e) {
+    console.error('Erreur getCollection:', e.message);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 
 app.post('/api/collections', async (req, res) => {
@@ -1752,10 +1661,29 @@ app.post('/api/collections', async (req, res) => {
   }
 });
 
-// ===== TOURNÉES =====
+// =============================================
+// [OPTIMISÉ] TOURNÉES - avec mode léger (sans signatures embarquées)
+// =============================================
 app.get('/api/tournees', async (req, res) => {
-  const tournees = await getTournees();
-  res.json(tournees);
+  try {
+    if (!db || !isConnected) return res.json([]);
+    
+    // Exclure les signatures base64 embarquées dans les collectes des tournées
+    const projection = {
+      'collectes.colSignature': 0,
+      'collectes.restoSignature': 0
+    };
+    
+    const tournees = await db.collection(COLLECTIONS.TOURNEES)
+      .find({}, { projection })
+      .sort({ dateDepart: -1 })
+      .toArray();
+    
+    res.json(tournees);
+  } catch (e) {
+    console.error('Erreur getTournees:', e.message);
+    res.json([]);
+  }
 });
 
 app.post('/api/tournees', async (req, res) => {
@@ -1770,13 +1698,11 @@ app.post('/api/tournees', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.put('/api/tournees/:id', async (req, res) => {
   const { id } = req.params;
   await updateTournee(id, sanitizeObject(req.body));
   res.json({ success: true });
 });
-
 // ===== RAPPORTS DE TOURNÉES =====
 app.get('/api/rapports-tournees', async (req, res) => {
   try {
@@ -1788,7 +1714,6 @@ app.get('/api/rapports-tournees', async (req, res) => {
     res.json([]);
   }
 });
-
 app.post('/api/rapports-tournees', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -1807,7 +1732,6 @@ app.post('/api/rapports-tournees', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 // ===== SETTINGS =====
 app.get('/api/settings', async (req, res) => {
   const settings = await getSettings();
@@ -1816,7 +1740,6 @@ app.get('/api/settings', async (req, res) => {
   publicSettings.hasBrevoKey = !!brevoApiKey;
   res.json(publicSettings);
 });
-
 app.put('/api/settings', async (req, res) => {
   try {
     const { brevoApiKey, ...otherSettings } = req.body;
@@ -1832,7 +1755,6 @@ app.put('/api/settings', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.put('/api/admin/password', async (req, res) => {
   try {
     const { currentPassword, newPassword } = sanitizeObject(req.body);
@@ -1862,7 +1784,6 @@ app.put('/api/admin/password', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 // ===== EMAIL (Brevo) =====
 app.post('/api/send-email', async (req, res) => {
   try {
@@ -1931,26 +1852,19 @@ app.post('/api/send-email', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 // ===== SMS (Brevo) =====
 app.post('/api/send-sms', async (req, res) => {
   try {
     const { to, message, content } = req.body;
     const smsMessage = message || content;
-    console.log('=== ENVOI SMS ===');
-    console.log('To (raw):', to);
-    console.log('Message:', smsMessage?.substring(0, 50));
     if (!to || !smsMessage) {
-      console.log('Erreur: Paramètres manquants');
       return res.status(400).json({ success: false, error: 'Paramètres manquants (to ou message)' });
     }
     const settings = await getSettings();
     if (!settings.brevoApiKey) {
-      console.log('Erreur: Clé API Brevo non configurée');
       return res.status(503).json({ success: false, error: 'Clé API Brevo non configurée' });
     }
     if (!settings.smsEnabled) {
-      console.log('Erreur: SMS désactivé dans les paramètres');
       return res.status(503).json({ success: false, error: 'SMS désactivé. Activez-le dans Paramètres.' });
     }
     let phoneNumber = typeof to === 'object' ? to.number : to;
@@ -1961,13 +1875,11 @@ app.post('/api/send-sms', async (req, res) => {
     if (!phoneNumber.startsWith('+')) {
       phoneNumber = phoneNumber.startsWith('0') ? prefix + phoneNumber.slice(1) : prefix + phoneNumber;
     }
-    console.log('Numéro formaté:', phoneNumber);
     const smsPayload = {
       sender: 'UCOANDCO',
       recipient: phoneNumber,
       content: smsMessage.slice(0, 160)
     };
-    console.log('Payload SMS:', JSON.stringify(smsPayload));
     const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
       method: 'POST',
       headers: {
@@ -1978,12 +1890,9 @@ app.post('/api/send-sms', async (req, res) => {
       body: JSON.stringify(smsPayload)
     });
     const responseData = await response.json();
-    console.log('Réponse Brevo SMS:', JSON.stringify(responseData));
     if (response.ok) {
-      console.log('SMS envoyé avec succès');
       res.json({ success: true, messageId: responseData.messageId });
     } else {
-      console.log('Erreur Brevo SMS:', responseData);
       let errorMsg = responseData.message || 'Erreur SMS Brevo';
       if (responseData.code === 'not_enough_credits') {
         errorMsg = 'Crédits SMS insuffisants. Achetez des crédits sur Brevo.';
@@ -1995,7 +1904,6 @@ app.post('/api/send-sms', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur: ' + error.message });
   }
 });
-
 // ===== AUDIT LOGS =====
 app.get('/api/audit-logs', authenticateToken, requireRole('admin'), async (req, res) => {
   if (!db || !isConnected) return res.json([]);
@@ -2016,20 +1924,43 @@ app.get('/api/audit-logs', authenticateToken, requireRole('admin'), async (req, 
   }
 });
 
-// ===== STATISTIQUES =====
+// =============================================
+// [OPTIMISÉ] STATISTIQUES - Utilise aggregation MongoDB au lieu de tout charger
+// =============================================
 app.get('/api/stats', async (req, res) => {
-  const restaurants = await getRestaurants();
-  const collectors = await getCollectors('approved');
-  const operators = await getOperators('approved');
-  const collections = await getCollections();
-  res.json({
-    restaurants: restaurants.filter(r => r.status === 'approved').length,
-    collectors: collectors.length,
-    operators: operators.length,
-    collections: collections.length,
-    totalVolume: Math.round(collections.reduce((sum, c) => sum + (parseFloat(c.quantite) || 0), 0) * 100) / 100,
-    totalAmount: Math.round(collections.reduce((sum, c) => sum + (parseFloat(c.montant) || 0), 0) * 100) / 100
-  });
+  try {
+    if (!db || !isConnected) {
+      return res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 });
+    }
+    
+    const [restaurantCount, collectorCount, operatorCount, collectionCount, volumeAgg] = await Promise.all([
+      db.collection(COLLECTIONS.RESTAURANTS).countDocuments({ status: 'approved' }),
+      db.collection(COLLECTIONS.COLLECTORS).countDocuments({ status: 'approved' }),
+      db.collection(COLLECTIONS.OPERATORS).countDocuments({ status: 'approved' }),
+      db.collection(COLLECTIONS.COLLECTIONS).countDocuments(),
+      db.collection(COLLECTIONS.COLLECTIONS).aggregate([
+        { $group: { 
+          _id: null, 
+          totalVolume: { $sum: { $toDouble: { $ifNull: ['$quantite', 0] } } },
+          totalAmount: { $sum: { $toDouble: { $ifNull: ['$montant', 0] } } }
+        }}
+      ]).toArray()
+    ]);
+    
+    const totals = volumeAgg[0] || { totalVolume: 0, totalAmount: 0 };
+    
+    res.json({
+      restaurants: restaurantCount,
+      collectors: collectorCount,
+      operators: operatorCount,
+      collections: collectionCount,
+      totalVolume: Math.round(totals.totalVolume * 100) / 100,
+      totalAmount: Math.round(totals.totalAmount * 100) / 100
+    });
+  } catch (e) {
+    console.error('Erreur stats:', e.message);
+    res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 });
+  }
 });
 
 // ===== PARTENAIRES =====
@@ -2043,7 +1974,6 @@ app.get('/api/partners', async (req, res) => {
     res.json([]);
   }
 });
-
 app.post('/api/partners', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2062,7 +1992,6 @@ app.post('/api/partners', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.put('/api/partners/:id', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2075,14 +2004,12 @@ app.put('/api/partners/:id', async (req, res) => {
     if (result.matchedCount === 0) {
       return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
     }
-    console.log('✅ Partenaire mis à jour:', id);
     res.json({ success: true });
   } catch (error) {
     console.error('Erreur PUT partner:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.delete('/api/partners/:id', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2093,14 +2020,12 @@ app.delete('/api/partners/:id', async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
     }
-    console.log('✅ Partenaire supprimé:', id);
     res.json({ success: true });
   } catch (error) {
     console.error('Erreur DELETE partner:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // ===== PRESTATAIRES =====
 const SERVICES_DISPONIBLES = [
   { id: 'bac_graisse', name: 'Entretien bac à graisse', icon: '🪣' },
@@ -2119,11 +2044,9 @@ const SERVICES_DISPONIBLES = [
   { id: 'securite', name: 'Sécurité incendie', icon: '🔥' },
   { id: 'autre', name: 'Autre service', icon: '📦' }
 ];
-
 app.get('/api/services-disponibles', (req, res) => {
   res.json(SERVICES_DISPONIBLES);
 });
-
 app.get('/api/prestataires', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
@@ -2134,7 +2057,6 @@ app.get('/api/prestataires', async (req, res) => {
     res.json([]);
   }
 });
-
 app.get('/api/prestataires/:id', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2153,7 +2075,6 @@ app.get('/api/prestataires/:id', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/prestataires', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2189,7 +2110,6 @@ app.post('/api/prestataires', async (req, res) => {
       createdBy: req.body.createdBy || 'admin'
     };
     await db.collection(COLLECTIONS.PRESTATAIRES).insertOne(newPrestataire);
-    console.log('✅ Nouveau prestataire créé:', prestataireId, '-', data.enseigne);
     await auditLog('PRESTATAIRE_CREATE', prestataireId, { enseigne: data.enseigne, services: data.services }, req);
     res.status(201).json({ success: true, id: prestataireId, prestataire: newPrestataire });
   } catch (error) {
@@ -2197,7 +2117,6 @@ app.post('/api/prestataires', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.put('/api/prestataires/:id', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2214,7 +2133,6 @@ app.put('/api/prestataires/:id', async (req, res) => {
     if (result.matchedCount === 0) {
       return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
     }
-    console.log('✅ Prestataire mis à jour:', id);
     await auditLog('PRESTATAIRE_UPDATE', id, { fields: Object.keys(data) }, req);
     res.json({ success: true });
   } catch (error) {
@@ -2222,7 +2140,6 @@ app.put('/api/prestataires/:id', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2235,7 +2152,6 @@ app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
     }
-    console.log('✅ Prestataire supprimé:', id);
     await auditLog('PRESTATAIRE_DELETE', id, {}, req);
     res.json({ success: true });
   } catch (error) {
@@ -2243,7 +2159,6 @@ app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.get('/api/prestataires/service/:serviceId', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
@@ -2258,7 +2173,6 @@ app.get('/api/prestataires/service/:serviceId', async (req, res) => {
     res.json([]);
   }
 });
-
 // ===== AVIS CLIENTS =====
 app.get('/api/avis', async (req, res) => {
   try {
@@ -2270,7 +2184,6 @@ app.get('/api/avis', async (req, res) => {
     res.json([]);
   }
 });
-
 app.post('/api/avis', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2282,14 +2195,12 @@ app.post('/api/avis', async (req, res) => {
     }
     avisData.dateCreation = avisData.dateCreation || new Date().toISOString();
     await db.collection(COLLECTIONS.AVIS).insertOne({ ...avisData, _id: avisData.id });
-    console.log('Nouvel avis enregistré:', avisData.id);
     res.status(201).json({ success: true, id: avisData.id });
   } catch (error) {
     console.error('Erreur création avis:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2303,7 +2214,6 @@ app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/avis/:id/read', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2320,7 +2230,6 @@ app.post('/api/avis/:id/read', async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 app.post('/api/avis/mark-all-read', async (req, res) => {
   try {
     if (!db || !isConnected) {
@@ -2330,21 +2239,18 @@ app.post('/api/avis/mark-all-read', async (req, res) => {
       { isRead: { $ne: true } },
       { $set: { isRead: true, readAt: new Date().toISOString() } }
     );
-    console.log(`✅ ${result.modifiedCount} avis marqués comme lus`);
     res.json({ success: true, count: result.modifiedCount });
   } catch (error) {
     console.error('Erreur marquage tous avis lus:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
-
 // ===== STRIPE - PAIEMENTS ABONNEMENTS =====
 const STRIPE_PLANS = {
   starter: { name: 'Starter', price: 0, stripePriceId: null },
   simple: { name: 'Simple', price: 1499, stripePriceId: null },
   premium: { name: 'Premium', price: 1999, stripePriceId: null }
 };
-
 async function initializeStripePrices(stripe) {
   try {
     const products = await stripe.products.list({ limit: 10 });
@@ -2379,33 +2285,25 @@ async function initializeStripePrices(stripe) {
     console.error('⚠️ Erreur initialisation prix Stripe:', error.message);
   }
 }
-
 app.post('/api/stripe/create-subscription', async (req, res) => {
   try {
     const { restaurantId, plan, email, enseigne, siret } = req.body;
     console.log('📦 Création abonnement:', { restaurantId, plan, email, enseigne });
-    const settings = await getSettings();
-    if (!settings?.stripeSecretKey) {
-      console.log('❌ stripeSecretKey manquante dans settings');
+    const stripe = await getStripe();
+    if (!stripe) {
       return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     }
-    console.log('✅ Clé Stripe trouvée');
-    const stripe = require('stripe')(settings.stripeSecretKey);
     if (plan === 'starter' || STRIPE_PLANS[plan]?.price === 0) {
       return res.json({ success: true, free: true, message: 'Formule gratuite - pas de paiement requis' });
     }
     if (!STRIPE_PLANS[plan]) {
-      console.log('❌ Plan inconnu:', plan);
       return res.status(400).json({ success: false, error: `Plan inconnu: ${plan}` });
     }
     if (!STRIPE_PLANS[plan].stripePriceId) {
-      console.log('🔄 Initialisation des prix Stripe...');
       await initializeStripePrices(stripe);
     }
     const planConfig = STRIPE_PLANS[plan];
-    console.log('📋 Config du plan:', { plan, stripePriceId: planConfig?.stripePriceId, price: planConfig?.price });
     if (!planConfig?.stripePriceId) {
-      console.log('⚠️ Prix non trouvé, création directe...');
       try {
         const product = await stripe.products.create({
           name: `Abonnement UCO ${planConfig.name}`,
@@ -2421,14 +2319,12 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
         });
         STRIPE_PLANS[plan].stripePriceId = price.id;
         STRIPE_PLANS[plan].stripeProductId = product.id;
-        console.log('✅ Prix créé directement:', price.id);
       } catch (createError) {
         console.error('❌ Erreur création prix:', createError.message);
         return res.status(400).json({ success: false, error: 'Erreur création prix Stripe: ' + createError.message });
       }
     }
     if (!STRIPE_PLANS[plan].stripePriceId) {
-      console.log('❌ Prix toujours non disponible après création');
       return res.status(400).json({ success: false, error: 'Impossible de configurer le prix Stripe' });
     }
     let customer;
@@ -2457,20 +2353,18 @@ app.post('/api/stripe/create-subscription', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
   req.body.plan = req.body.plan || 'simple';
   return res.redirect(307, '/api/stripe/create-subscription');
 });
-
 app.post('/api/stripe/webhook', async (req, res) => {
   try {
     const settings = await getSettings();
     if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) {
-      console.log('❌ Webhook: Stripe non configuré');
       return res.status(400).json({ error: 'Stripe non configuré' });
     }
-    const stripe = require('stripe')(settings.stripeSecretKey);
+    const stripe = await getStripe();
+    if (!stripe) return res.status(400).json({ error: 'Stripe non configuré' });
     const sig = req.headers['stripe-signature'];
     let event;
     try {
@@ -2484,7 +2378,6 @@ app.post('/api/stripe/webhook', async (req, res) => {
       case 'checkout.session.completed': {
         const session = event.data.object;
         const { restaurantId, siret, plan } = session.metadata || {};
-        console.log('📋 Metadata reçues:', { restaurantId, siret, plan });
         if (!restaurantId && !siret) {
           console.error('❌ Aucun identifiant restaurant dans les metadata');
           break;
@@ -2506,7 +2399,6 @@ app.post('/api/stripe/webhook', async (req, res) => {
         }
         if (siret) searchCriteria.push({ siret: siret });
         if (session.customer_email) searchCriteria.push({ email: session.customer_email });
-        console.log('🔍 Recherche restaurant avec:', JSON.stringify(searchCriteria));
         if (db && isConnected) {
           const updateResult = await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
             { $or: searchCriteria },
@@ -2524,7 +2416,6 @@ app.post('/api/stripe/webhook', async (req, res) => {
               }
             }
           );
-          console.log('📊 Résultat mise à jour:', { matched: updateResult.matchedCount, modified: updateResult.modifiedCount });
           if (updateResult.matchedCount === 0) {
             console.error('❌ Aucun restaurant trouvé avec les critères:', searchCriteria);
           } else {
@@ -2538,14 +2429,8 @@ app.post('/api/stripe/webhook', async (req, res) => {
         if (invoice.subscription && invoice.billing_reason !== 'subscription_create' && db && isConnected) {
           await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
             { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { 
-              $set: { 
-                'subscription.lastPaymentDate': new Date().toISOString(),
-                'subscription.status': 'active'
-              }
-            }
+            { $set: { 'subscription.lastPaymentDate': new Date().toISOString(), 'subscription.status': 'active' } }
           );
-          console.log(`✅ Prélèvement mensuel réussi pour subscription: ${invoice.subscription}`);
         }
         break;
       }
@@ -2555,14 +2440,10 @@ app.post('/api/stripe/webhook', async (req, res) => {
           await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
             { 'subscription.stripeSubscriptionId': invoice.subscription },
             { 
-              $set: { 
-                'subscription.status': 'payment_failed',
-                'subscription.lastFailedAt': new Date().toISOString()
-              },
+              $set: { 'subscription.status': 'payment_failed', 'subscription.lastFailedAt': new Date().toISOString() },
               $inc: { 'subscription.failedAttempts': 1 }
             }
           );
-          console.log(`⚠️ Échec paiement pour subscription: ${invoice.subscription}`);
         }
         break;
       }
@@ -2574,7 +2455,6 @@ app.post('/api/stripe/webhook', async (req, res) => {
             { $set: { 'subscription.status': 'cancelled', 'subscription.endDate': new Date().toISOString() } }
           );
         }
-        console.log(`❌ Abonnement Stripe annulé: ${subscription.id}`);
         break;
       }
     }
@@ -2584,32 +2464,23 @@ app.post('/api/stripe/webhook', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 app.post('/api/stripe/cancel-subscription', async (req, res) => {
   try {
     const { subscriptionId } = req.body;
-    const settings = await getSettings();
-    if (!settings?.stripeSecretKey) {
-      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
-    }
-    const stripe = require('stripe')(settings.stripeSecretKey);
+    const stripe = await getStripe();
+    if (!stripe) return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     const subscription = await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
-    console.log('✅ Abonnement marqué pour annulation:', subscriptionId);
     res.json({ success: true, subscription });
   } catch (error) {
     console.error('Erreur annulation abonnement:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.post('/api/stripe/customer-portal', async (req, res) => {
   try {
     const { customerId } = req.body;
-    const settings = await getSettings();
-    if (!settings?.stripeSecretKey) {
-      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
-    }
-    const stripe = require('stripe')(settings.stripeSecretKey);
+    const stripe = await getStripe();
+    if (!stripe) return res.status(400).json({ success: false, error: 'Stripe non configuré' });
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
       return_url: `${req.headers.origin || 'https://uco-and-co.fr'}`
@@ -2620,7 +2491,6 @@ app.post('/api/stripe/customer-portal', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // ===== QONTO - FACTURES =====
 app.post('/api/qonto/configure', async (req, res) => {
   try {
@@ -2650,7 +2520,6 @@ app.post('/api/qonto/configure', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.get('/api/qonto/status', async (req, res) => {
   try {
     const settings = await getSettings();
@@ -2673,7 +2542,6 @@ app.get('/api/qonto/status', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 // ===== GESTION DES ERREURS =====
 app.use((err, req, res, next) => {
   console.error(`[${req.requestId}] Erreur:`, err.message);
@@ -2682,12 +2550,10 @@ app.use((err, req, res, next) => {
   }
   res.status(500).json({ success: false, error: 'Erreur serveur interne' });
 });
-
-// Route 404 - DOIT ÊTRE EN DERNIER
+// Route 404
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Route non trouvée' });
 });
-
 // =============================================
 // DÉMARRAGE DU SERVEUR
 // =============================================
@@ -2698,12 +2564,14 @@ async function startServer() {
     const settings = await getSettings();
     if (settings?.stripeSecretKey && settings?.stripeEnabled) {
       console.log('🔄 Initialisation des prix Stripe...');
-      const stripe = require('stripe')(settings.stripeSecretKey);
-      await initializeStripePrices(stripe);
-      console.log('✅ Prix Stripe initialisés:', {
-        simple: STRIPE_PLANS.simple.stripePriceId ? '✅' : '❌',
-        premium: STRIPE_PLANS.premium.stripePriceId ? '✅' : '❌'
-      });
+      const stripe = await getStripe();
+      if (stripe) {
+        await initializeStripePrices(stripe);
+        console.log('✅ Prix Stripe initialisés:', {
+          simple: STRIPE_PLANS.simple.stripePriceId ? '✅' : '❌',
+          premium: STRIPE_PLANS.premium.stripePriceId ? '✅' : '❌'
+        });
+      }
     } else {
       console.log('⚠️ Stripe non configuré ou désactivé');
     }
@@ -2714,7 +2582,7 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log('');
     console.log('🛢️  ========================================');
-    console.log('🛢️  UCO AND CO - Backend API (SÉCURISÉ)');
+    console.log('🛢️  UCO AND CO - Backend API (OPTIMISÉ)');
     console.log('🛢️  ========================================');
     console.log(`🚀 Serveur démarré sur le port ${PORT}`);
     console.log(`📊 Base de données: ${isConnected ? 'MongoDB Atlas ✅' : 'Mode mémoire ⚠️'}`);
@@ -2729,8 +2597,15 @@ async function startServer() {
     console.log('   ✅ Audit logs');
     console.log('   ✅ Reconnexion auto MongoDB');
     console.log('   ✅ Anti-crash global');
+    console.log('⚡ Optimisations mémoire:');
+    console.log('   ✅ Compression gzip');
+    console.log('   ✅ Collections: signatures base64 exclues');
+    console.log('   ✅ Tournées: signatures exclues');
+    console.log('   ✅ Stats: aggregation MongoDB');
+    console.log('   ✅ Restaurants: projection (sans PDFs)');
+    console.log('   ✅ Stripe: instance singleton');
+    console.log(`   📊 Mémoire: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
     console.log('');
   });
 }
-
 startServer();
