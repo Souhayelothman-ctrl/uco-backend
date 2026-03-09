@@ -21,14 +21,30 @@ const PORT = process.env.PORT || 3001;
 process.on('uncaughtException', (err) => {
   console.error('❌ [UNCAUGHT EXCEPTION]', err.message);
   console.error(err.stack);
-  // NE PAS faire process.exit() - laisser le serveur tourner
 });
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ [UNHANDLED REJECTION]', reason);
-  // NE PAS faire process.exit() - laisser le serveur tourner
 });
+
 // =============================================
-// CONFIGURATION SÉCURITÉ
+// [FIX OOM] MONITORING MEMOIRE PROACTIF
+// =============================================
+let memoryWarningCount = 0;
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  if (heapMB > 400) {
+    memoryWarningCount++;
+    console.warn('⚠️ MEMOIRE CRITIQUE: Heap=' + heapMB + 'MB, RSS=' + rssMB + 'MB (warning #' + memoryWarningCount + ')');
+    if (global.gc) { global.gc(); console.log('GC force'); }
+  } else if (heapMB > 300) {
+    console.warn('⚠️ Memoire elevee: Heap=' + heapMB + 'MB, RSS=' + rssMB + 'MB');
+  }
+}, 30000);
+
+// =============================================
+// CONFIGURATION SECURITE
 // =============================================
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const JWT_EXPIRES_IN = '24h';
@@ -36,7 +52,7 @@ const BCRYPT_ROUNDS = 12;
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_TIME = 15 * 60 * 1000;
 // =============================================
-// MIDDLEWARES DE SÉCURITÉ
+// MIDDLEWARES DE SECURITE
 // =============================================
 app.use(helmet({
   contentSecurityPolicy: {
@@ -49,10 +65,6 @@ app.use(helmet({
   },
   crossOriginEmbedderPolicy: false,
 }));
-
-// =============================================
-// COMPRESSION GZIP - Réduit les réponses de 70-90%
-// =============================================
 app.use(compression({
   level: 6,
   threshold: 1024,
@@ -61,7 +73,6 @@ app.use(compression({
     return compression.filter(req, res);
   }
 }));
-
 const allowedOrigins = [
   'https://uco-and-co.netlify.app',
   'https://uco-and-co.fr',
@@ -83,8 +94,8 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
       callback(null, true);
     } else {
-      console.warn('🚫 CORS bloqué:', origin);
-      callback(new Error('Non autorisé par CORS'));
+      console.warn('CORS bloque:', origin);
+      callback(new Error('Non autorise par CORS'));
     }
   },
   credentials: true,
@@ -94,7 +105,7 @@ app.use(cors({
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 500,
-  message: { success: false, error: 'Trop de requêtes, réessayez dans 15 minutes' },
+  message: { success: false, error: 'Trop de requetes, reessayez dans 15 minutes' },
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.path === '/api/health' || (req.path === '/api/settings' && req.method === 'GET')
@@ -102,14 +113,14 @@ const generalLimiter = rateLimit({
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
-  message: { success: false, error: 'Trop de tentatives de connexion, réessayez dans 15 minutes' },
+  message: { success: false, error: 'Trop de tentatives de connexion' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 const strictLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 10,
-  message: { success: false, error: 'Limite atteinte, réessayez plus tard' },
+  message: { success: false, error: 'Limite atteinte, reessayez plus tard' },
 });
 app.use('/api/', generalLimiter);
 app.use('/api/auth/', authLimiter);
@@ -132,7 +143,7 @@ app.use((req, res, next) => {
 app.use(mongoSanitize({
   replaceWith: '_',
   onSanitize: ({ req, key }) => {
-    console.warn(`🚫 Tentative d'injection NoSQL détectée: ${key}`);
+    console.warn('Tentative injection NoSQL detectee: ' + key);
   }
 }));
 app.use(xss());
@@ -141,13 +152,13 @@ app.use((req, res, next) => {
   const requestId = uuidv4().slice(0, 8);
   req.requestId = requestId;
   if (req.path.includes('/auth') || req.path.includes('/password')) {
-    console.log(`[${new Date().toISOString()}] ${requestId} ${req.method} ${req.path} - IP: ${req.ip}`);
+    console.log('[' + new Date().toISOString() + '] ' + requestId + ' ' + req.method + ' ' + req.path + ' - IP: ' + req.ip);
   }
   res.setHeader('X-Request-ID', requestId);
   next();
 });
 // =============================================
-// CONFIGURATION MONGODB ATLAS - ROBUSTE
+// CONFIGURATION MONGODB ATLAS
 // =============================================
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const DB_NAME = 'ucoandco';
@@ -213,29 +224,25 @@ const cache = {
 // =============================================
 async function connectDB() {
   if (!MONGODB_URI) {
-    console.warn('⚠️ MONGODB_URI non configurée - Mode mémoire uniquement');
+    console.warn('MONGODB_URI non configuree');
     return false;
   }
   try {
-    console.log('🔄 Connexion sécurisée à MongoDB Atlas...');
+    console.log('Connexion securisee a MongoDB Atlas...');
     mongoClient = new MongoClient(MONGODB_URI, mongoOptions);
-    
     mongoClient.on('close', () => {
-      console.warn('⚠️ Connexion MongoDB fermée');
+      console.warn('Connexion MongoDB fermee');
       isConnected = false;
       scheduleReconnect();
     });
-    
     mongoClient.on('error', (err) => {
-      console.error('❌ Erreur MongoDB:', err.message);
+      console.error('Erreur MongoDB:', err.message);
       isConnected = false;
     });
-    
     await mongoClient.connect();
     db = mongoClient.db(DB_NAME);
     isConnected = true;
     reconnectAttempts = 0;
-    
     try {
       await db.collection(COLLECTIONS.COLLECTORS).createIndex({ email: 1 }, { unique: true, sparse: true });
       await db.collection(COLLECTIONS.OPERATORS).createIndex({ email: 1 }, { unique: true, sparse: true });
@@ -246,27 +253,25 @@ async function connectDB() {
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ action: 1 });
       await db.collection(COLLECTIONS.SESSIONS).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
       await db.collection(COLLECTIONS.TOURNEES_EN_COURS).createIndex({ collectorEmail: 1 }, { unique: true });
+      // [FIX OOM] TTL index: auto-suppression tournees abandonnees apres 7 jours
+      await db.collection(COLLECTIONS.TOURNEES_EN_COURS).createIndex({ lastUpdate: 1 }, { expireAfterSeconds: 604800 }).catch(() => {});
+      // [FIX OOM] TTL index: auto-suppression audit logs apres 90 jours
+      await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ timestamp: 1 }, { expireAfterSeconds: 7776000 }).catch(() => {});
     } catch (indexError) {
-      console.warn('⚠️ Erreur création index:', indexError.message);
+      console.warn('Erreur creation index:', indexError.message);
     }
-    
     try {
       const existingSettings = await db.collection(COLLECTIONS.SETTINGS).findOne({ _id: 'main' });
       if (!existingSettings) {
-        await db.collection(COLLECTIONS.SETTINGS).insertOne({ 
-          _id: 'main', 
-          ...initialData.settings, 
-          admin: initialData.admin 
-        });
+        await db.collection(COLLECTIONS.SETTINGS).insertOne({ _id: 'main', ...initialData.settings, admin: initialData.admin });
       }
     } catch (settingsError) {
-      console.warn('⚠️ Erreur initialisation settings:', settingsError.message);
+      console.warn('Erreur initialisation settings:', settingsError.message);
     }
-    
-    console.log('✅ Connecté à MongoDB Atlas avec succès (mode sécurisé)');
+    console.log('Connecte a MongoDB Atlas avec succes');
     return true;
   } catch (error) {
-    console.error('❌ Erreur connexion MongoDB:', error.message);
+    console.error('Erreur connexion MongoDB:', error.message);
     isConnected = false;
     scheduleReconnect();
     return false;
@@ -274,43 +279,29 @@ async function connectDB() {
 }
 function scheduleReconnect() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error('❌ Max tentatives de reconnexion atteint. Le serveur continue sans DB.');
+    console.error('Max tentatives de reconnexion atteint.');
     return;
   }
-  
   reconnectAttempts++;
   const delay = Math.min(5000 * reconnectAttempts, 30000);
-  
-  console.log(`🔄 Tentative de reconnexion ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} dans ${delay/1000}s...`);
-  
+  console.log('Tentative de reconnexion ' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ' dans ' + (delay/1000) + 's...');
   setTimeout(async () => {
     if (!isConnected) {
       try {
-        if (mongoClient) {
-          await mongoClient.close().catch(() => {});
-        }
+        if (mongoClient) { await mongoClient.close().catch(() => {}); }
         await connectDB();
       } catch (e) {
-        console.error('❌ Échec reconnexion:', e.message);
+        console.error('Echec reconnexion:', e.message);
         scheduleReconnect();
       }
     }
   }, delay);
 }
 function checkDBConnection(req, res, next) {
-  if (req.path === '/api/health') {
-    return next();
-  }
-  
+  if (req.path === '/api/health') return next();
   if (!isConnected || !db) {
-    console.warn('⚠️ Requête reçue mais DB non connectée:', req.path);
-    return res.status(503).json({
-      success: false,
-      error: 'Service temporairement indisponible - Base de données en cours de reconnexion',
-      retryAfter: 5
-    });
+    return res.status(503).json({ success: false, error: 'Service temporairement indisponible', retryAfter: 5 });
   }
-  
   next();
 }
 app.use('/api/collectors', checkDBConnection);
@@ -322,36 +313,28 @@ app.use('/api/settings', checkDBConnection);
 app.use('/api/auth', checkDBConnection);
 app.use('/api/prestataires', checkDBConnection);
 app.use('/api/avis', checkDBConnection);
-// Routes Stripe Webhook
 const stripeWebhook = require('./routes/stripe-webhook');
 app.use('/api/stripe', stripeWebhook);
-// Routes demandes de collecte (urgences)
 const demandesCollecteRoutes = require('./routes/demandes-collecte');
 app.use('/api/demandes-collecte', demandesCollecteRoutes);
 process.on('SIGINT', async () => {
-  console.log('\n🛑 Arrêt du serveur (SIGINT)...');
-  if (mongoClient) {
-    try { await mongoClient.close(); console.log('✅ Connexion MongoDB fermée'); } catch (e) {}
-  }
+  console.log('Arret du serveur (SIGINT)...');
+  if (mongoClient) { try { await mongoClient.close(); } catch (e) {} }
   process.exit(0);
 });
 process.on('SIGTERM', async () => {
-  console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
-  if (mongoClient) {
-    try { await mongoClient.close(); } catch (e) {}
-  }
+  console.log('Arret du serveur (SIGTERM)...');
+  if (mongoClient) { try { await mongoClient.close(); } catch (e) {} }
   process.exit(0);
 });
 // =============================================
-// FONCTIONS UTILITAIRES DE SÉCURITÉ
+// FONCTIONS UTILITAIRES
 // =============================================
 function isValidEmail(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 function isStrongPassword(password) {
-  const strongRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
-  return strongRegex.test(password);
+  return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/.test(password);
 }
 function sanitizeInput(input, key = '') {
   if (typeof input !== 'string') return input;
@@ -361,9 +344,7 @@ function sanitizeInput(input, key = '') {
   return isUnlimited ? sanitized : sanitized.slice(0, 5000);
 }
 function sanitizeObject(obj, parentKey = '') {
-  if (typeof obj !== 'object' || obj === null) {
-    return sanitizeInput(obj, parentKey);
-  }
+  if (typeof obj !== 'object' || obj === null) return sanitizeInput(obj, parentKey);
   const sanitized = Array.isArray(obj) ? [] : {};
   for (const key of Object.keys(obj)) {
     if (key.startsWith('$')) continue;
@@ -371,34 +352,20 @@ function sanitizeObject(obj, parentKey = '') {
   }
   return sanitized;
 }
-function generateToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-}
-function verifyToken(token) {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch (error) {
-    return null;
-  }
-}
+function generateToken(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN }); }
+function verifyToken(token) { try { return jwt.verify(token, JWT_SECRET); } catch (e) { return null; } }
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) {
-    return res.status(401).json({ success: false, error: 'Token manquant' });
-  }
+  if (!token) return res.status(401).json({ success: false, error: 'Token manquant' });
   const decoded = verifyToken(token);
-  if (!decoded) {
-    return res.status(403).json({ success: false, error: 'Token invalide ou expiré' });
-  }
+  if (!decoded) return res.status(403).json({ success: false, error: 'Token invalide ou expire' });
   req.user = decoded;
   next();
 }
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
-      return res.status(403).json({ success: false, error: 'Accès non autorisé' });
-    }
+    if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ success: false, error: 'Acces non autorise' });
     next();
   };
 }
@@ -406,18 +373,11 @@ async function auditLog(action, userId, details, req) {
   if (!db || !isConnected) return;
   try {
     await db.collection(COLLECTIONS.AUDIT_LOGS).insertOne({
-      _id: uuidv4(),
-      action,
-      userId,
-      details: sanitizeObject(details),
-      ip: req?.ip || 'unknown',
-      userAgent: req?.headers['user-agent'] || 'unknown',
-      requestId: req?.requestId,
-      timestamp: new Date().toISOString()
+      _id: uuidv4(), action, userId, details: sanitizeObject(details),
+      ip: req?.ip || 'unknown', userAgent: req?.headers['user-agent'] || 'unknown',
+      requestId: req?.requestId, timestamp: new Date().toISOString()
     });
-  } catch (error) {
-    console.error('Erreur audit log:', error.message);
-  }
+  } catch (error) { console.error('Erreur audit log:', error.message); }
 }
 function isAccountLocked(user) {
   if (!user.lockUntil) return false;
@@ -432,2183 +392,664 @@ async function incrementLoginAttempts(collection, identifier) {
       update.$set = { lockUntil: new Date(Date.now() + LOCK_TIME).toISOString() };
     }
     await db.collection(collection).updateOne({ email: identifier }, update);
-  } catch (e) {
-    console.error('Erreur incrementLoginAttempts:', e.message);
-  }
+  } catch (e) { console.error('Erreur incrementLoginAttempts:', e.message); }
 }
 async function resetLoginAttempts(collection, identifier) {
   if (!db || !isConnected) return;
   try {
-    await db.collection(collection).updateOne(
-      { email: identifier },
-      { $set: { loginAttempts: 0, lockUntil: null } }
-    );
-  } catch (e) {
-    console.error('Erreur resetLoginAttempts:', e.message);
-  }
+    await db.collection(collection).updateOne({ email: identifier }, { $set: { loginAttempts: 0, lockUntil: null } });
+  } catch (e) { console.error('Erreur resetLoginAttempts:', e.message); }
 }
 // =============================================
-// FONCTIONS D'ACCÈS AUX DONNÉES
+// FONCTIONS D ACCES AUX DONNEES
 // =============================================
 async function getSettings() {
   try {
     if (!db || !isConnected) return initialData.settings;
-    
-    if (cache.settings && (Date.now() - cache.lastSettingsUpdate) < cache.TTL) {
-      return cache.settings;
-    }
-    
+    if (cache.settings && (Date.now() - cache.lastSettingsUpdate) < cache.TTL) return cache.settings;
     const allSettings = await db.collection('settings').find({}).toArray();
-    
-    if (allSettings.length === 0) {
-      return initialData.settings;
-    }
-    
+    if (allSettings.length === 0) return initialData.settings;
     let mergedSettings = {};
-    for (const doc of allSettings) {
-      mergedSettings = { ...mergedSettings, ...doc };
-    }
-    
+    for (const doc of allSettings) { mergedSettings = { ...mergedSettings, ...doc }; }
     cache.settings = mergedSettings;
     cache.lastSettingsUpdate = Date.now();
-    
-    console.log('✅ Settings chargés:', {
-      hasStripeSecretKey: !!mergedSettings.stripeSecretKey,
-      hasStripePublicKey: !!mergedSettings.stripePublicKey,
-      stripeEnabled: mergedSettings.stripeEnabled,
-      qontoEnabled: mergedSettings.qontoEnabled
-    });
-    
+    console.log('Settings charges:', { hasStripeSecretKey: !!mergedSettings.stripeSecretKey, hasStripePublicKey: !!mergedSettings.stripePublicKey, stripeEnabled: mergedSettings.stripeEnabled, qontoEnabled: mergedSettings.qontoEnabled });
     return mergedSettings;
-  } catch (error) {
-    console.error('❌ Erreur récupération settings:', error.message);
-    return initialData.settings;
-  }
+  } catch (error) { console.error('Erreur recuperation settings:', error.message); return initialData.settings; }
 }
 async function updateSettings(newSettings) {
   if (!db || !isConnected) return false;
-  
   try {
     const existingSettings = await getSettings() || {};
-    
-    const mergedSettings = {
-      ...existingSettings,
-      ...newSettings,
-      admin: existingSettings.admin,
-      reviewLinks: {
-        ...(existingSettings.reviewLinks || {}),
-        ...(newSettings.reviewLinks || {})
-      }
-    };
-    
-    if (!newSettings.brevoApiKey && existingSettings.brevoApiKey) {
-      mergedSettings.brevoApiKey = existingSettings.brevoApiKey;
-    }
-    if (!newSettings.stripeSecretKey && existingSettings.stripeSecretKey) {
-      mergedSettings.stripeSecretKey = existingSettings.stripeSecretKey;
-    }
-    if ((!newSettings.stripePublicKey || newSettings.stripePublicKey.startsWith('••••')) && existingSettings.stripePublicKey) {
-      mergedSettings.stripePublicKey = existingSettings.stripePublicKey;
-    }
-    if (!newSettings.stripeWebhookSecret && existingSettings.stripeWebhookSecret) {
-      mergedSettings.stripeWebhookSecret = existingSettings.stripeWebhookSecret;
-    }
-    if (!newSettings.qontoSecretKey && existingSettings.qontoSecretKey) {
-      mergedSettings.qontoSecretKey = existingSettings.qontoSecretKey;
-    }
-    if (!newSettings.qontoOrganizationId && existingSettings.qontoOrganizationId) {
-      mergedSettings.qontoOrganizationId = existingSettings.qontoOrganizationId;
-    }
-    if (!newSettings.qontoOrganizationName && existingSettings.qontoOrganizationName) {
-      mergedSettings.qontoOrganizationName = existingSettings.qontoOrganizationName;
-    }
-    
+    const mergedSettings = { ...existingSettings, ...newSettings, admin: existingSettings.admin, reviewLinks: { ...(existingSettings.reviewLinks || {}), ...(newSettings.reviewLinks || {}) } };
+    if (!newSettings.brevoApiKey && existingSettings.brevoApiKey) mergedSettings.brevoApiKey = existingSettings.brevoApiKey;
+    if (!newSettings.stripeSecretKey && existingSettings.stripeSecretKey) mergedSettings.stripeSecretKey = existingSettings.stripeSecretKey;
+    if ((!newSettings.stripePublicKey || newSettings.stripePublicKey.startsWith('••••')) && existingSettings.stripePublicKey) mergedSettings.stripePublicKey = existingSettings.stripePublicKey;
+    if (!newSettings.stripeWebhookSecret && existingSettings.stripeWebhookSecret) mergedSettings.stripeWebhookSecret = existingSettings.stripeWebhookSecret;
+    if (!newSettings.qontoSecretKey && existingSettings.qontoSecretKey) mergedSettings.qontoSecretKey = existingSettings.qontoSecretKey;
+    if (!newSettings.qontoOrganizationId && existingSettings.qontoOrganizationId) mergedSettings.qontoOrganizationId = existingSettings.qontoOrganizationId;
+    if (!newSettings.qontoOrganizationName && existingSettings.qontoOrganizationName) mergedSettings.qontoOrganizationName = existingSettings.qontoOrganizationName;
     delete mergedSettings._id;
-    
     const existingDoc = await db.collection(COLLECTIONS.SETTINGS).findOne({});
     const docId = existingDoc?._id || 'main';
-    
-    await db.collection(COLLECTIONS.SETTINGS).updateOne(
-      { _id: docId },
-      { $set: mergedSettings },
-      { upsert: true }
-    );
-    
-    cache.settings = null;
-    cache.lastSettingsUpdate = 0;
-    
-    // Invalider l'instance Stripe si les settings changent
-    stripeInstance = null;
-    
-    console.log('✅ Settings mis à jour avec succès');
+    await db.collection(COLLECTIONS.SETTINGS).updateOne({ _id: docId }, { $set: mergedSettings }, { upsert: true });
+    cache.settings = null; cache.lastSettingsUpdate = 0; stripeInstance = null;
+    console.log('Settings mis a jour avec succes');
     return true;
-  } catch (error) {
-    console.error('❌ Erreur updateSettings:', error.message);
-    return false;
-  }
+  } catch (error) { console.error('Erreur updateSettings:', error.message); return false; }
 }
-async function getAdmin() {
-  const settings = await getSettings();
-  return settings.admin || initialData.admin;
-}
-// Collecteurs
-async function getCollectors(status = null) {
-  if (!db || !isConnected) return [];
-  try {
-    const query = status ? { status } : {};
-    return await db.collection(COLLECTIONS.COLLECTORS).find(query).toArray();
-  } catch (e) {
-    console.error('Erreur getCollectors:', e.message);
-    return [];
-  }
-}
-async function getCollectorByEmail(email) {
-  if (!db || !isConnected) return null;
-  try {
-    return await db.collection(COLLECTIONS.COLLECTORS).findOne({ email: sanitizeInput(email) });
-  } catch (e) {
-    console.error('Erreur getCollectorByEmail:', e.message);
-    return null;
-  }
-}
-async function addCollector(collector) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitized = sanitizeObject(collector);
-    const result = await db.collection(COLLECTIONS.COLLECTORS).insertOne({
-      ...sanitized,
-      _id: sanitized.email,
-      loginAttempts: 0,
-      lockUntil: null,
-      createdAt: new Date().toISOString()
-    });
-    return result.insertedId;
-  } catch (e) {
-    console.error('Erreur addCollector:', e.message);
-    return null;
-  }
-}
-async function updateCollector(email, data) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.COLLECTORS).updateOne(
-      { email: sanitizeInput(email) },
-      { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
-    );
-    return true;
-  } catch (e) {
-    console.error('Erreur updateCollector:', e.message);
-    return false;
-  }
-}
-async function deleteCollector(email) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.COLLECTORS).deleteOne({ email: sanitizeInput(email) });
-    return true;
-  } catch (e) {
-    console.error('Erreur deleteCollector:', e.message);
-    return false;
-  }
-}
-// Opérateurs
-async function getOperators(status = null) {
-  if (!db || !isConnected) return [];
-  try {
-    const query = status ? { status } : {};
-    return await db.collection(COLLECTIONS.OPERATORS).find(query).toArray();
-  } catch (e) {
-    console.error('Erreur getOperators:', e.message);
-    return [];
-  }
-}
-async function getOperatorByEmail(email) {
-  if (!db || !isConnected) return null;
-  try {
-    return await db.collection(COLLECTIONS.OPERATORS).findOne({ email: sanitizeInput(email) });
-  } catch (e) {
-    console.error('Erreur getOperatorByEmail:', e.message);
-    return null;
-  }
-}
-async function addOperator(operator) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitized = sanitizeObject(operator);
-    const result = await db.collection(COLLECTIONS.OPERATORS).insertOne({
-      ...sanitized,
-      _id: sanitized.email,
-      loginAttempts: 0,
-      lockUntil: null,
-      createdAt: new Date().toISOString()
-    });
-    return result.insertedId;
-  } catch (e) {
-    console.error('Erreur addOperator:', e.message);
-    return null;
-  }
-}
-async function updateOperator(email, data) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.OPERATORS).updateOne(
-      { email: sanitizeInput(email) },
-      { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
-    );
-    return true;
-  } catch (e) {
-    console.error('Erreur updateOperator:', e.message);
-    return false;
-  }
-}
-async function deleteOperator(email) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.OPERATORS).deleteOne({ email: sanitizeInput(email) });
-    return true;
-  } catch (e) {
-    console.error('Erreur deleteOperator:', e.message);
-    return false;
-  }
-}
-// Restaurants
-async function getRestaurants(status = null) {
-  if (!db || !isConnected) return [];
-  try {
-    const query = status ? { status } : {};
-    return await db.collection(COLLECTIONS.RESTAURANTS).find(query).toArray();
-  } catch (e) {
-    console.error('Erreur getRestaurants:', e.message);
-    return [];
-  }
-}
-async function getRestaurantById(id) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitizedId = sanitizeInput(id);
-    return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ 
-      $or: [
-        { id: sanitizedId },
-        { siret: sanitizedId },
-        { qrCode: sanitizedId }
-      ]
-    });
-  } catch (e) {
-    console.error('Erreur getRestaurantById:', e.message);
-    return null;
-  }
-}
-async function getRestaurantByQRCode(qrCode) {
-  if (!db || !isConnected) return null;
-  try {
-    return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ qrCode: sanitizeInput(qrCode) });
-  } catch (e) {
-    console.error('Erreur getRestaurantByQRCode:', e.message);
-    return null;
-  }
-}
-async function getRestaurantByEmail(email) {
-  if (!db || !isConnected) return null;
-  try {
-    return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ email: sanitizeInput(email) });
-  } catch (e) {
-    console.error('Erreur getRestaurantByEmail:', e.message);
-    return null;
-  }
-}
-async function addRestaurant(restaurant) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitized = sanitizeObject(restaurant);
-    const result = await db.collection(COLLECTIONS.RESTAURANTS).insertOne({
-      ...sanitized,
-      _id: sanitized.id,
-      loginAttempts: 0,
-      lockUntil: null,
-      createdAt: new Date().toISOString()
-    });
-    return result.insertedId;
-  } catch (e) {
-    console.error('Erreur addRestaurant:', e.message);
-    return null;
-  }
-}
-async function updateRestaurant(id, data) {
-  if (!db || !isConnected) return false;
-  try {
-    const sanitizedId = sanitizeInput(id);
-    await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-      { $or: [{ id: sanitizedId }, { siret: sanitizedId }, { qrCode: sanitizedId }] },
-      { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }
-    );
-    return true;
-  } catch (e) {
-    console.error('Erreur updateRestaurant:', e.message);
-    return false;
-  }
-}
-async function deleteRestaurant(id) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.RESTAURANTS).deleteOne({ id: sanitizeInput(id) });
-    return true;
-  } catch (e) {
-    console.error('Erreur deleteRestaurant:', e.message);
-    return false;
-  }
-}
-// Collections - fonction interne (utilisée par addCollection)
-async function addCollection(collection) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitized = sanitizeObject(collection);
-    const result = await db.collection(COLLECTIONS.COLLECTIONS).insertOne({
-      ...sanitized,
-      _id: sanitized.id || uuidv4(),
-      createdAt: new Date().toISOString()
-    });
-    return result.insertedId;
-  } catch (e) {
-    console.error('Erreur addCollection:', e.message);
-    return null;
-  }
-}
-// Tournées - fonction interne
-async function addTournee(tournee) {
-  if (!db || !isConnected) return null;
-  try {
-    const sanitized = sanitizeObject(tournee);
-    const result = await db.collection(COLLECTIONS.TOURNEES).insertOne({
-      ...sanitized,
-      _id: sanitized.id || uuidv4(),
-      createdAt: new Date().toISOString()
-    });
-    return result.insertedId;
-  } catch (e) {
-    console.error('Erreur addTournee:', e.message);
-    return null;
-  }
-}
-async function updateTournee(id, data) {
-  if (!db || !isConnected) return false;
-  try {
-    await db.collection(COLLECTIONS.TOURNEES).updateOne(
-      { _id: sanitizeInput(id) },
-      { $set: sanitizeObject(data) }
-    );
-    return true;
-  } catch (e) {
-    console.error('Erreur updateTournee:', e.message);
-    return false;
-  }
-}
-// Numéros uniques
-async function generateCollectorNumber() {
-  const collectors = await getCollectors('approved');
-  const existingNumbers = collectors.filter(c => c.collectorNumber).map(c => c.collectorNumber);
-  let num = 1;
-  while (existingNumbers.includes(num)) num++;
-  return num;
-}
-async function generateOperatorNumber() {
-  const operators = await getOperators('approved');
-  const existingNumbers = operators.filter(o => o.operatorNumber).map(o => o.operatorNumber);
-  let num = 1;
-  while (existingNumbers.includes(num)) num++;
-  return num;
-}
-
-// =============================================
-// STRIPE - Instance unique (évite fuites mémoire)
-// =============================================
+async function getAdmin() { const settings = await getSettings(); return settings.admin || initialData.admin; }
+async function getCollectors(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.COLLECTORS).find(q).toArray(); } catch (e) { return []; } }
+async function getCollectorByEmail(email) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.COLLECTORS).findOne({ email: sanitizeInput(email) }); } catch (e) { return null; } }
+async function addCollector(collector) { if (!db || !isConnected) return null; try { const s = sanitizeObject(collector); return (await db.collection(COLLECTIONS.COLLECTORS).insertOne({ ...s, _id: s.email, loginAttempts: 0, lockUntil: null, createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addCollector:', e.message); return null; } }
+async function updateCollector(email, data) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.COLLECTORS).updateOne({ email: sanitizeInput(email) }, { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }); return true; } catch (e) { return false; } }
+async function deleteCollector(email) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.COLLECTORS).deleteOne({ email: sanitizeInput(email) }); return true; } catch (e) { return false; } }
+async function getOperators(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.OPERATORS).find(q).toArray(); } catch (e) { return []; } }
+async function getOperatorByEmail(email) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.OPERATORS).findOne({ email: sanitizeInput(email) }); } catch (e) { return null; } }
+async function addOperator(operator) { if (!db || !isConnected) return null; try { const s = sanitizeObject(operator); return (await db.collection(COLLECTIONS.OPERATORS).insertOne({ ...s, _id: s.email, loginAttempts: 0, lockUntil: null, createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addOperator:', e.message); return null; } }
+async function updateOperator(email, data) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.OPERATORS).updateOne({ email: sanitizeInput(email) }, { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }); return true; } catch (e) { return false; } }
+async function deleteOperator(email) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.OPERATORS).deleteOne({ email: sanitizeInput(email) }); return true; } catch (e) { return false; } }
+async function getRestaurants(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.RESTAURANTS).find(q).toArray(); } catch (e) { return []; } }
+async function getRestaurantById(id) { if (!db || !isConnected) return null; try { const s = sanitizeInput(id); return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ $or: [{ id: s }, { siret: s }, { qrCode: s }] }); } catch (e) { return null; } }
+async function getRestaurantByQRCode(qrCode) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ qrCode: sanitizeInput(qrCode) }); } catch (e) { return null; } }
+async function getRestaurantByEmail(email) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ email: sanitizeInput(email) }); } catch (e) { return null; } }
+async function addRestaurant(restaurant) { if (!db || !isConnected) return null; try { const s = sanitizeObject(restaurant); return (await db.collection(COLLECTIONS.RESTAURANTS).insertOne({ ...s, _id: s.id, loginAttempts: 0, lockUntil: null, createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addRestaurant:', e.message); return null; } }
+async function updateRestaurant(id, data) { if (!db || !isConnected) return false; try { const s = sanitizeInput(id); await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ $or: [{ id: s }, { siret: s }, { qrCode: s }] }, { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }); return true; } catch (e) { return false; } }
+async function deleteRestaurant(id) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.RESTAURANTS).deleteOne({ id: sanitizeInput(id) }); return true; } catch (e) { return false; } }
+async function addCollection(collection) { if (!db || !isConnected) return null; try { const s = sanitizeObject(collection); return (await db.collection(COLLECTIONS.COLLECTIONS).insertOne({ ...s, _id: s.id || uuidv4(), createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addCollection:', e.message); return null; } }
+async function addTournee(tournee) { if (!db || !isConnected) return null; try { const s = sanitizeObject(tournee); return (await db.collection(COLLECTIONS.TOURNEES).insertOne({ ...s, _id: s.id || uuidv4(), createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addTournee:', e.message); return null; } }
+async function updateTournee(id, data) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.TOURNEES).updateOne({ _id: sanitizeInput(id) }, { $set: sanitizeObject(data) }); return true; } catch (e) { return false; } }
+async function generateCollectorNumber() { const c = await getCollectors('approved'); const nums = c.filter(x => x.collectorNumber).map(x => x.collectorNumber); let n = 1; while (nums.includes(n)) n++; return n; }
+async function generateOperatorNumber() { const o = await getOperators('approved'); const nums = o.filter(x => x.operatorNumber).map(x => x.operatorNumber); let n = 1; while (nums.includes(n)) n++; return n; }
 let stripeInstance = null;
-async function getStripe() {
-  if (stripeInstance) return stripeInstance;
-  const settings = await getSettings();
-  if (!settings?.stripeSecretKey) return null;
-  stripeInstance = require('stripe')(settings.stripeSecretKey);
-  return stripeInstance;
-}
-
+async function getStripe() { if (stripeInstance) return stripeInstance; const s = await getSettings(); if (!s?.stripeSecretKey) return null; stripeInstance = require('stripe')(s.stripeSecretKey); return stripeInstance; }
 // =============================================
 // ROUTES API
 // =============================================
-// ===== PROXY APIs GOUVERNEMENTALES =====
 app.get('/api/proxy/siret/:siret', async (req, res) => {
   try {
     const siret = req.params.siret.replace(/\D/g, '');
-    if (siret.length !== 14) {
-      return res.status(400).json({ error: 'SIRET invalide (14 chiffres requis)' });
-    }
-    const response = await fetch(`https://recherche-entreprises.api.gouv.fr/search?q=${siret}&page=1&per_page=1`);
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'API non disponible' });
-    }
-    const data = await response.json();
-    res.json(data);
-  } catch (e) {
-    console.error('Erreur proxy SIRET:', e.message);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
+    if (siret.length !== 14) return res.status(400).json({ error: 'SIRET invalide' });
+    const response = await fetch('https://recherche-entreprises.api.gouv.fr/search?q=' + siret + '&page=1&per_page=1');
+    if (!response.ok) return res.status(response.status).json({ error: 'API non disponible' });
+    res.json(await response.json());
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 app.get('/api/proxy/villes/:cp', async (req, res) => {
   try {
     const cp = req.params.cp.replace(/\D/g, '');
-    if (cp.length !== 5) {
-      return res.status(400).json({ error: 'Code postal invalide (5 chiffres requis)' });
-    }
-    const response = await fetch(`https://geo.api.gouv.fr/communes?codePostal=${cp}&fields=nom&format=json`);
-    if (!response.ok) {
-      return res.status(response.status).json({ error: 'API non disponible' });
-    }
-    const data = await response.json();
-    res.json(data);
-  } catch (e) {
-    console.error('Erreur proxy villes:', e.message);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
+    if (cp.length !== 5) return res.status(400).json({ error: 'Code postal invalide' });
+    const response = await fetch('https://geo.api.gouv.fr/communes?codePostal=' + cp + '&fields=nom&format=json');
+    if (!response.ok) return res.status(response.status).json({ error: 'API non disponible' });
+    res.json(await response.json());
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
-// Health check
+// [FIX OOM] Health check avec details memoire
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
+  const mem = process.memoryUsage();
+  res.status(200).json({
+    status: 'OK',
     database: isConnected ? 'MongoDB Atlas' : 'MongoDB disconnected',
-    persistent: isConnected,
-    secure: true,
+    persistent: isConnected, secure: true,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
+    memoryUsage: {
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024) + 'MB',
+      rss: Math.round(mem.rss / 1024 / 1024) + 'MB',
+      external: Math.round(mem.external / 1024 / 1024) + 'MB'
+    },
+    memoryWarnings: memoryWarningCount,
     reconnectAttempts: reconnectAttempts
   });
 });
-// Test email
 app.post('/api/test-email', async (req, res) => {
   try {
     const { to } = req.body;
-    if (!to) {
-      return res.status(400).json({ success: false, error: 'Email destinataire requis' });
-    }
+    if (!to) return res.status(400).json({ success: false, error: 'Email destinataire requis' });
     const settings = await getSettings();
-    const apiKey = settings.brevoApiKey;
-    if (!apiKey) {
-      return res.status(503).json({ success: false, error: 'Clé API Brevo non configurée' });
-    }
-    const simpleHtml = '<html><head><meta charset="UTF-8"></head><body><h1 style="color:green;">Test UCO AND CO</h1><p>Si ce texte est <strong>vert</strong>, le HTML fonctionne correctement!</p><p>Date: ' + new Date().toLocaleString('fr-FR') + '</p></body></html>';
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'api-key': apiKey,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' },
-        to: [{ email: to }],
-        subject: 'Test HTML UCO AND CO',
-        htmlContent: simpleHtml
-      })
-    });
+    if (!settings.brevoApiKey) return res.status(503).json({ success: false, error: 'Cle API Brevo non configuree' });
+    const simpleHtml = '<html><head><meta charset="UTF-8"></head><body><h1 style="color:green;">Test UCO AND CO</h1><p>Date: ' + new Date().toLocaleString('fr-FR') + '</p></body></html>';
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', { method: 'POST', headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' }, body: JSON.stringify({ sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' }, to: [{ email: to }], subject: 'Test HTML UCO AND CO', htmlContent: simpleHtml }) });
     const responseData = await response.json();
-    if (response.ok) {
-      res.json({ success: true, messageId: responseData.messageId });
-    } else {
-      res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo', details: responseData });
-    }
-  } catch (error) {
-    console.error('Erreur test email:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+    if (response.ok) res.json({ success: true, messageId: responseData.messageId });
+    else res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo' });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 // =============================================
-// TOURNÉES EN COURS - SYNCHRONISATION MULTI-APPAREILS
+// TOURNEES EN COURS - SYNCHRONISATION
 // =============================================
 app.get('/api/tournees/en-cours/:email', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
     const email = decodeURIComponent(req.params.email);
-    console.log(`📱 [SYNC] Recherche tournée en cours pour: ${email}`);
-    const tournee = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).findOne({ 
-      collectorEmail: email,
-      active: true,
-      dateFin: null
-    });
+    console.log('[SYNC] Recherche tournee pour: ' + email);
+    const tournee = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).findOne({ collectorEmail: email, active: true, dateFin: null });
     if (tournee) {
-      console.log(`✅ [SYNC] Tournée trouvée: ${tournee.id}, collectes: ${tournee.collectes?.length || 0}`);
+      console.log('[SYNC] Tournee trouvee: ' + tournee.id + ', collectes: ' + (tournee.collectes?.length || 0));
       const { _id, ...tourneeData } = tournee;
       return res.json(tourneeData);
     }
-    console.log(`ℹ️ [SYNC] Pas de tournée en cours pour: ${email}`);
     return res.json(null);
-  } catch (error) {
-    console.error('❌ Erreur GET tournee en cours:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
+// [FIX OOM] POST tournees en cours - payload size check + no sanitizeObject
 app.post('/api/tournees/en-cours', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    // [FIX OOM] Verifier la taille du payload AVANT traitement
+    const rawBody = JSON.stringify(req.body);
+    const payloadKB = Math.round(rawBody.length / 1024);
+    if (rawBody.length > 500000) {
+      console.warn('[SYNC] Payload rejete: ' + payloadKB + 'KB (max 500KB)');
+      return res.status(413).json({ success: false, error: 'Payload trop volumineux' });
     }
-    const tourneeData = sanitizeObject(req.body);
-    if (!tourneeData.collectorEmail) {
-      return res.status(400).json({ success: false, error: 'collectorEmail requis' });
-    }
+    // [FIX OOM] NE PAS utiliser sanitizeObject ici - trop couteux en memoire
+    const tourneeData = req.body;
+    if (!tourneeData.collectorEmail) return res.status(400).json({ success: false, error: 'collectorEmail requis' });
     tourneeData.lastUpdate = new Date().toISOString();
-    console.log(`💾 [SYNC] Sauvegarde tournée: ${tourneeData.id}, collectes: ${tourneeData.collectes?.length || 0}`);
-    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
+    console.log('[SYNC] Sauvegarde tournee: ' + tourneeData.id + ', collectes: ' + (tourneeData.collectes?.length || 0) + ', payload: ' + payloadKB + 'KB');
+    await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
       { collectorEmail: tourneeData.collectorEmail },
       { $set: { ...tourneeData, _id: tourneeData.collectorEmail } },
       { upsert: true }
     );
-    console.log(`✅ [SYNC] Tournée sauvegardée`);
     res.json({ success: true, tourneeId: tourneeData.id });
-  } catch (error) {
-    console.error('❌ Erreur POST tournee en cours:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
-  }
+  } catch (error) { console.error('Erreur POST tournee en cours:', error); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.delete('/api/tournees/en-cours/:email', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
     const email = decodeURIComponent(req.params.email);
-    console.log(`🗑️ [SYNC] Suppression tournée pour: ${email}`);
     const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteOne({ collectorEmail: email });
-    console.log(`✅ [SYNC] Supprimé: ${result.deletedCount > 0}`);
     return res.json({ success: true, deleted: result.deletedCount > 0 });
-  } catch (error) {
-    console.error('❌ Erreur DELETE tournee en cours:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.post('/api/tournees/paused', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
     const tourneeData = sanitizeObject(req.body);
-    if (!tourneeData.collectorEmail) {
-      return res.status(400).json({ success: false, error: 'collectorEmail requis' });
-    }
-    console.log(`⏸️ [SYNC] Pause tournée pour: ${tourneeData.collectorEmail}`);
-    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
+    if (!tourneeData.collectorEmail) return res.status(400).json({ success: false, error: 'collectorEmail requis' });
+    await db.collection(COLLECTIONS.TOURNEES_EN_COURS).updateOne(
       { collectorEmail: tourneeData.collectorEmail },
-      { 
-        $set: {
-          ...tourneeData,
-          _id: tourneeData.collectorEmail,
-          isPaused: true,
-          status: 'paused',
-          pausedAt: new Date().toISOString(),
-          lastUpdate: new Date().toISOString()
-        }
-      },
+      { $set: { ...tourneeData, _id: tourneeData.collectorEmail, isPaused: true, status: 'paused', pausedAt: new Date().toISOString(), lastUpdate: new Date().toISOString() } },
       { upsert: true }
     );
-    console.log(`✅ [SYNC] Tournée en pause sauvegardée`);
     res.json({ success: true, tourneeId: tourneeData.id });
-  } catch (error) {
-    console.error('❌ Erreur POST tournee paused:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur', details: error.message });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-// ===== AUTHENTIFICATION SÉCURISÉE =====
+// ===== AUTHENTIFICATION =====
 app.post('/api/auth/admin', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     const admin = await getAdmin();
-    if (isAccountLocked(admin)) {
-      await auditLog('ADMIN_LOGIN_LOCKED', email, { reason: 'Account locked' }, req);
-      return res.status(423).json({ success: false, error: 'Compte verrouillé. Réessayez dans 15 minutes.' });
-    }
-    if (email !== admin.email) {
-      await auditLog('ADMIN_LOGIN_FAILED', email, { reason: 'Invalid email' }, req);
-      return res.status(401).json({ success: false, error: 'Identifiants incorrects' });
-    }
+    if (isAccountLocked(admin)) { await auditLog('ADMIN_LOGIN_LOCKED', email, {}, req); return res.status(423).json({ success: false, error: 'Compte verrouille' }); }
+    if (email !== admin.email) { await auditLog('ADMIN_LOGIN_FAILED', email, {}, req); return res.status(401).json({ success: false, error: 'Identifiants incorrects' }); }
     const isValid = await bcrypt.compare(password, admin.password);
-    if (!isValid) {
-      await auditLog('ADMIN_LOGIN_FAILED', email, { reason: 'Invalid password' }, req);
-      return res.status(401).json({ success: false, error: 'Identifiants incorrects' });
-    }
+    if (!isValid) { await auditLog('ADMIN_LOGIN_FAILED', email, {}, req); return res.status(401).json({ success: false, error: 'Identifiants incorrects' }); }
     const token = generateToken({ role: 'admin', email });
     await auditLog('ADMIN_LOGIN_SUCCESS', email, {}, req);
     res.json({ success: true, role: 'admin', token, expiresIn: JWT_EXPIRES_IN });
-  } catch (error) {
-    console.error('Erreur auth admin:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.post('/api/auth/collector', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ success: false, error: 'Format d\'email invalide' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    if (!isValidEmail(email)) return res.status(400).json({ success: false, error: 'Format email invalide' });
     const collector = await getCollectorByEmail(email);
-    if (!collector) {
-      await auditLog('COLLECTOR_LOGIN_FAILED', email, { reason: 'Not found' }, req);
-      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
-    }
-    if (collector.status === 'pending') {
-      return res.json({ success: false, error: 'pending' });
-    }
-    if (collector.status !== 'approved') {
-      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
-    }
-    if (isAccountLocked(collector)) {
-      await auditLog('COLLECTOR_LOGIN_LOCKED', email, { reason: 'Account locked' }, req);
-      return res.status(423).json({ success: false, error: 'Compte verrouillé. Réessayez dans 15 minutes.' });
-    }
+    if (!collector) { await auditLog('COLLECTOR_LOGIN_FAILED', email, { reason: 'Not found' }, req); return res.status(401).json({ success: false, error: 'Compte non trouve' }); }
+    if (collector.status === 'pending') return res.json({ success: false, error: 'pending' });
+    if (collector.status !== 'approved') return res.status(401).json({ success: false, error: 'Compte non approuve' });
+    if (isAccountLocked(collector)) return res.status(423).json({ success: false, error: 'Compte verrouille' });
     const isValid = await bcrypt.compare(password, collector.password);
-    if (!isValid) {
-      await incrementLoginAttempts(COLLECTIONS.COLLECTORS, email);
-      await auditLog('COLLECTOR_LOGIN_FAILED', email, { reason: 'Invalid password' }, req);
-      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
-    }
+    if (!isValid) { await incrementLoginAttempts(COLLECTIONS.COLLECTORS, email); return res.status(401).json({ success: false, error: 'Mot de passe incorrect' }); }
     await resetLoginAttempts(COLLECTIONS.COLLECTORS, email);
     const token = generateToken({ role: 'collector', email, collectorNumber: collector.collectorNumber });
     const { password: _, loginAttempts, lockUntil, ...data } = collector;
     await auditLog('COLLECTOR_LOGIN_SUCCESS', email, {}, req);
     res.json({ success: true, role: 'collector', data, token, expiresIn: JWT_EXPIRES_IN });
-  } catch (error) {
-    console.error('Erreur auth collector:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.post('/api/auth/operator', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     const operator = await getOperatorByEmail(email);
-    if (!operator) {
-      await auditLog('OPERATOR_LOGIN_FAILED', email, { reason: 'Not found' }, req);
-      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
-    }
-    if (operator.status === 'pending') {
-      return res.json({ success: false, error: 'pending' });
-    }
-    if (operator.status !== 'approved') {
-      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
-    }
-    if (isAccountLocked(operator)) {
-      return res.status(423).json({ success: false, error: 'Compte verrouillé' });
-    }
+    if (!operator) return res.status(401).json({ success: false, error: 'Compte non trouve' });
+    if (operator.status === 'pending') return res.json({ success: false, error: 'pending' });
+    if (operator.status !== 'approved') return res.status(401).json({ success: false, error: 'Compte non approuve' });
+    if (isAccountLocked(operator)) return res.status(423).json({ success: false, error: 'Compte verrouille' });
     const isValid = await bcrypt.compare(password, operator.password);
-    if (!isValid) {
-      await incrementLoginAttempts(COLLECTIONS.OPERATORS, email);
-      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
-    }
+    if (!isValid) { await incrementLoginAttempts(COLLECTIONS.OPERATORS, email); return res.status(401).json({ success: false, error: 'Mot de passe incorrect' }); }
     await resetLoginAttempts(COLLECTIONS.OPERATORS, email);
     const token = generateToken({ role: 'operator', email });
     const { password: _, loginAttempts, lockUntil, ...data } = operator;
     await auditLog('OPERATOR_LOGIN_SUCCESS', email, {}, req);
     res.json({ success: true, role: 'operator', data, token });
-  } catch (error) {
-    console.error('Erreur auth operator:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.post('/api/auth/restaurant', async (req, res) => {
   try {
     const { email, password } = sanitizeObject(req.body);
-    console.log('=== AUTH RESTAURANT ===');
-    console.log('Email:', email);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     const restaurant = await getRestaurantByEmail(email);
-    console.log('Restaurant trouvé:', restaurant ? 'Oui' : 'Non');
-    if (!restaurant) {
-      return res.status(401).json({ success: false, error: 'Compte non trouvé' });
-    }
-    if (restaurant.status === 'pending') {
-      return res.json({ success: false, error: 'pending' });
-    }
-    if (restaurant.status === 'terminated') {
-      return res.status(401).json({ success: false, error: 'Contrat résilié' });
-    }
-    const isApproved = restaurant.status === 'approved' || 
-                       (restaurant.tempPassword && !restaurant.status) ||
-                       (restaurant.createdBy === 'admin' && !restaurant.status);
-    if (!isApproved) {
-      return res.status(401).json({ success: false, error: 'Compte non approuvé' });
-    }
-    if (isAccountLocked(restaurant)) {
-      return res.status(423).json({ success: false, error: 'Compte verrouillé' });
-    }
-    let isValid = false;
-    let usedTempPassword = false;
-    if (restaurant.password) {
-      try {
-        isValid = await bcrypt.compare(password, restaurant.password);
-      } catch (bcryptError) {
-        console.error('Erreur bcrypt:', bcryptError);
-      }
-    }
-    if (!isValid && restaurant.tempPassword) {
-      isValid = (password === restaurant.tempPassword);
-      usedTempPassword = isValid;
-    }
-    if (!isValid) {
-      await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
-      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
-    }
-    if (!restaurant.status && (restaurant.tempPassword || restaurant.createdBy === 'admin')) {
-      await updateRestaurant(restaurant.id, { status: 'approved' });
-    }
+    if (!restaurant) return res.status(401).json({ success: false, error: 'Compte non trouve' });
+    if (restaurant.status === 'pending') return res.json({ success: false, error: 'pending' });
+    if (restaurant.status === 'terminated') return res.status(401).json({ success: false, error: 'Contrat resilie' });
+    const isApproved = restaurant.status === 'approved' || (restaurant.tempPassword && !restaurant.status) || (restaurant.createdBy === 'admin' && !restaurant.status);
+    if (!isApproved) return res.status(401).json({ success: false, error: 'Compte non approuve' });
+    if (isAccountLocked(restaurant)) return res.status(423).json({ success: false, error: 'Compte verrouille' });
+    let isValid = false; let usedTempPassword = false;
+    if (restaurant.password) { try { isValid = await bcrypt.compare(password, restaurant.password); } catch (e) {} }
+    if (!isValid && restaurant.tempPassword) { isValid = (password === restaurant.tempPassword); usedTempPassword = isValid; }
+    if (!isValid) { await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email); return res.status(401).json({ success: false, error: 'Mot de passe incorrect' }); }
+    if (!restaurant.status && (restaurant.tempPassword || restaurant.createdBy === 'admin')) await updateRestaurant(restaurant.id, { status: 'approved' });
     await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
     const token = generateToken({ role: 'restaurant', email, id: restaurant.id });
     const { password: _, tempPassword: __, loginAttempts, lockUntil, ...data } = restaurant;
     await auditLog('RESTAURANT_LOGIN_SUCCESS', email, { usedTempPassword }, req);
-    res.json({ 
-      success: true, 
-      role: 'restaurant', 
-      data: { ...data, usedTempPassword, needsContractSignature: !restaurant.contratStatus || restaurant.contratStatus !== 'signed' }, 
-      token 
-    });
-  } catch (error) {
-    console.error('Erreur auth restaurant:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+    res.json({ success: true, role: 'restaurant', data: { ...data, usedTempPassword, needsContractSignature: !restaurant.contratStatus || restaurant.contratStatus !== 'signed' }, token });
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.get('/api/auth/verify', authenticateToken, (req, res) => {
-  res.json({ success: true, user: req.user });
-});
-// ===== COLLECTEURS =====
+app.get('/api/auth/verify', authenticateToken, (req, res) => { res.json({ success: true, user: req.user }); });
+// ===== COLLECTEURS CRUD =====
 app.post('/api/collectors/register', async (req, res) => {
   try {
     const { email, password, ...data } = sanitizeObject(req.body);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ success: false, error: 'Format d\'email invalide' });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ success: false, error: 'Le mot de passe doit contenir au moins 8 caractères' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    if (!isValidEmail(email)) return res.status(400).json({ success: false, error: 'Format email invalide' });
+    if (password.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
     const existing = await getCollectorByEmail(email);
-    if (existing) {
-      return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
-    }
-    await addCollector({
-      email,
-      password: await bcrypt.hash(password, BCRYPT_ROUNDS),
-      ...data,
-      status: 'pending',
-      dateRequest: new Date().toISOString()
-    });
+    if (existing) return res.status(409).json({ success: false, error: 'Email deja utilise' });
+    await addCollector({ email, password: await bcrypt.hash(password, BCRYPT_ROUNDS), ...data, status: 'pending', dateRequest: new Date().toISOString() });
     await auditLog('COLLECTOR_REGISTER', email, { status: 'pending' }, req);
     res.status(201).json({ success: true });
-  } catch (error) {
-    console.error('Erreur register collector:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.get('/api/collectors/pending', async (req, res) => {
-  const collectors = await getCollectors('pending');
-  res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
-});
-app.get('/api/collectors/approved', async (req, res) => {
-  const collectors = await getCollectors('approved');
-  res.json(collectors.map(({ password, loginAttempts, lockUntil, ...c }) => c));
-});
-app.post('/api/collectors/:email/approve', async (req, res) => {
-  try {
-    const { email } = req.params;
-    const collectorNumber = await generateCollectorNumber();
-    await updateCollector(email, {
-      status: 'approved',
-      collectorNumber,
-      dateApproval: new Date().toISOString()
-    });
-    await auditLog('COLLECTOR_APPROVED', email, { collectorNumber }, req);
-    res.json({ success: true, collectorNumber });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.post('/api/collectors/:email/reject', async (req, res) => {
-  const { email } = req.params;
-  await deleteCollector(email);
-  await auditLog('COLLECTOR_REJECTED', email, {}, req);
-  res.json({ success: true });
-});
-app.delete('/api/collectors/:email', async (req, res) => {
-  const { email } = req.params;
-  await deleteCollector(email);
-  await auditLog('COLLECTOR_DELETED', email, {}, req);
-  res.json({ success: true });
-});
-// ===== OPÉRATEURS =====
+app.get('/api/collectors/pending', async (req, res) => { const c = await getCollectors('pending'); res.json(c.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.get('/api/collectors/approved', async (req, res) => { const c = await getCollectors('approved'); res.json(c.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.post('/api/collectors/:email/approve', async (req, res) => { try { const { email } = req.params; const n = await generateCollectorNumber(); await updateCollector(email, { status: 'approved', collectorNumber: n, dateApproval: new Date().toISOString() }); await auditLog('COLLECTOR_APPROVED', email, { collectorNumber: n }, req); res.json({ success: true, collectorNumber: n }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/collectors/:email/reject', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
+app.delete('/api/collectors/:email', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
+// ===== OPERATEURS CRUD =====
 app.post('/api/operators/register', async (req, res) => {
   try {
     const { email, password, ...data } = sanitizeObject(req.body);
-    if (!email || !password) {
-      return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     const existing = await getOperatorByEmail(email);
-    if (existing) {
-      return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
-    }
-    await addOperator({
-      email,
-      password: await bcrypt.hash(password, BCRYPT_ROUNDS),
-      ...data,
-      status: 'pending',
-      dateRequest: new Date().toISOString()
-    });
-    await auditLog('OPERATOR_REGISTER', email, { status: 'pending' }, req);
+    if (existing) return res.status(409).json({ success: false, error: 'Email deja utilise' });
+    await addOperator({ email, password: await bcrypt.hash(password, BCRYPT_ROUNDS), ...data, status: 'pending', dateRequest: new Date().toISOString() });
     res.status(201).json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.get('/api/operators/pending', async (req, res) => {
-  const operators = await getOperators('pending');
-  res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
-});
-app.get('/api/operators/approved', async (req, res) => {
-  const operators = await getOperators('approved');
-  res.json(operators.map(({ password, loginAttempts, lockUntil, ...o }) => o));
-});
-app.post('/api/operators/:email/approve', async (req, res) => {
-  const { email } = req.params;
-  const operatorNumber = await generateOperatorNumber();
-  await updateOperator(email, {
-    status: 'approved',
-    operatorNumber,
-    dateApproval: new Date().toISOString()
-  });
-  await auditLog('OPERATOR_APPROVED', email, { operatorNumber }, req);
-  res.json({ success: true, operatorNumber });
-});
-app.post('/api/operators/:email/reject', async (req, res) => {
-  const { email } = req.params;
-  await deleteOperator(email);
-  await auditLog('OPERATOR_REJECTED', email, {}, req);
-  res.json({ success: true });
-});
-app.delete('/api/operators/:email', async (req, res) => {
-  const { email } = req.params;
-  await deleteOperator(email);
-  res.json({ success: true });
-});
-// ===== RESTAURANTS =====
+app.get('/api/operators/pending', async (req, res) => { const o = await getOperators('pending'); res.json(o.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.get('/api/operators/approved', async (req, res) => { const o = await getOperators('approved'); res.json(o.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.post('/api/operators/:email/approve', async (req, res) => { const { email } = req.params; const n = await generateOperatorNumber(); await updateOperator(email, { status: 'approved', operatorNumber: n, dateApproval: new Date().toISOString() }); res.json({ success: true, operatorNumber: n }); });
+app.post('/api/operators/:email/reject', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
+app.delete('/api/operators/:email', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
+// ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
     const { email, password, id, qrCode, siret, ...data } = sanitizeObject(req.body);
-    
     let existingBySiret = null;
-    if (siret && db && isConnected) {
-      existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
-    }
-    
+    if (siret && db && isConnected) existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
     if (existingBySiret) {
-      if (email && email !== existingBySiret.email) {
-        const existingByEmail = await getRestaurantByEmail(email);
-        if (existingByEmail && existingByEmail.siret !== siret) {
-          return res.status(409).json({ success: false, error: 'Cet email est déjà utilisé par un autre restaurant' });
-        }
-      }
-      
-      const isAccountFinalization = !existingBySiret.password && password;
-      const isResubmission = existingBySiret.status === 'terminated';
-      
-      const updateData = {
-        ...data,
-        email: email || existingBySiret.email,
-        dateRequest: new Date().toISOString()
-      };
-      
-      if (password) {
-        updateData.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
-      }
-      
-      if (isAccountFinalization && existingBySiret.status === 'approved') {
-        updateData.status = 'approved';
-        updateData.passwordSetDate = new Date().toISOString();
-      } else {
-        updateData.status = 'pending';
-        updateData.isResubmission = isResubmission;
-      }
-      
-      await updateRestaurant(existingBySiret.id, updateData);
-      
-      const logAction = isAccountFinalization ? 'RESTAURANT_FINALIZE_ACCOUNT' : 'RESTAURANT_RESUBMIT';
-      await auditLog(logAction, email || existingBySiret.id, { status: updateData.status, siret, isAccountFinalization, isResubmission }, req);
-      
-      return res.status(200).json({ 
-        success: true, 
-        id: existingBySiret.id, 
-        qrCode: existingBySiret.qrCode || existingBySiret.id,
-        isAccountFinalization,
-        isResubmission,
-        status: updateData.status,
-        message: isAccountFinalization ? 'Compte finalisé avec succès' : 'Demande de réinscription soumise'
-      });
+      if (email && email !== existingBySiret.email) { const ebye = await getRestaurantByEmail(email); if (ebye && ebye.siret !== siret) return res.status(409).json({ success: false, error: 'Cet email est deja utilise' }); }
+      const isFinalization = !existingBySiret.password && password;
+      const isResub = existingBySiret.status === 'terminated';
+      const upd = { ...data, email: email || existingBySiret.email, dateRequest: new Date().toISOString() };
+      if (password) upd.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      if (isFinalization && existingBySiret.status === 'approved') { upd.status = 'approved'; upd.passwordSetDate = new Date().toISOString(); } else { upd.status = 'pending'; upd.isResubmission = isResub; }
+      await updateRestaurant(existingBySiret.id, upd);
+      return res.status(200).json({ success: true, id: existingBySiret.id, qrCode: existingBySiret.qrCode || existingBySiret.id, isAccountFinalization: isFinalization, isResubmission: isResub, status: upd.status });
     }
-    
-    if (email) {
-      const existingByEmail = await getRestaurantByEmail(email);
-      if (existingByEmail) {
-        return res.status(409).json({ success: false, error: 'Cet email est déjà utilisé' });
-      }
-    }
-    
-    let newQRCode = qrCode;
-    if (!newQRCode || !newQRCode.startsWith('QR-')) {
-      const allRestaurants = await getRestaurants();
-      const existingNumbers = allRestaurants
-        .filter(r => r.qrCode && r.qrCode.startsWith('QR-'))
-        .map(r => parseInt(r.qrCode.replace('QR-', '')) || 0);
-      const maxNumber = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-      newQRCode = `QR-${String(maxNumber + 1).padStart(5, '0')}`;
-    }
-    
-    const existingQR = await getRestaurantByQRCode(newQRCode);
-    if (existingQR) {
-      const allRestaurants = await getRestaurants();
-      const existingNumbers = allRestaurants
-        .filter(r => r.qrCode && r.qrCode.startsWith('QR-'))
-        .map(r => parseInt(r.qrCode.replace('QR-', '')) || 0);
-      const maxNumber = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-      newQRCode = `QR-${String(maxNumber + 1).padStart(5, '0')}`;
-    }
-    
-    const restaurantId = id || newQRCode;
-    
-    await addRestaurant({
-      id: restaurantId,
-      qrCode: newQRCode,
-      email: email || '',
-      password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null,
-      siret: siret || '',
-      ...data,
-      status: 'pending',
-      dateRequest: new Date().toISOString()
-    });
-    
-    await auditLog('RESTAURANT_REGISTER', email || restaurantId, { status: 'pending', qrCode: newQRCode }, req);
-    
-    res.status(201).json({ success: true, id: restaurantId, qrCode: newQRCode });
-  } catch (error) {
-    console.error('Erreur register restaurant:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+    if (email) { const ebye = await getRestaurantByEmail(email); if (ebye) return res.status(409).json({ success: false, error: 'Cet email est deja utilise' }); }
+    let newQR = qrCode;
+    if (!newQR || !newQR.startsWith('QR-')) { const all = await getRestaurants(); const nums = all.filter(r => r.qrCode && r.qrCode.startsWith('QR-')).map(r => parseInt(r.qrCode.replace('QR-', '')) || 0); newQR = 'QR-' + String((nums.length > 0 ? Math.max(...nums) : 0) + 1).padStart(5, '0'); }
+    const existingQR = await getRestaurantByQRCode(newQR);
+    if (existingQR) { const all = await getRestaurants(); const nums = all.filter(r => r.qrCode && r.qrCode.startsWith('QR-')).map(r => parseInt(r.qrCode.replace('QR-', '')) || 0); newQR = 'QR-' + String((nums.length > 0 ? Math.max(...nums) : 0) + 1).padStart(5, '0'); }
+    const rid = id || newQR;
+    await addRestaurant({ id: rid, qrCode: newQR, email: email || '', password: password ? await bcrypt.hash(password, BCRYPT_ROUNDS) : null, siret: siret || '', ...data, status: 'pending', dateRequest: new Date().toISOString() });
+    res.status(201).json({ success: true, id: rid, qrCode: newQR });
+  } catch (error) { console.error('Erreur register restaurant:', error); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.get('/api/restaurants/pending', async (req, res) => {
-  const restaurants = await getRestaurants('pending');
-  res.json(restaurants.map(({ password, loginAttempts, lockUntil, ...r }) => r));
-});
-
-// =============================================
-// [OPTIMISÉ] GET /api/restaurants - Exclure champs lourds (signatures, PDFs)
-// =============================================
+app.get('/api/restaurants/pending', async (req, res) => { const r = await getRestaurants('pending'); res.json(r.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
 app.get('/api/restaurants', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    
-    const restaurants = await db.collection(COLLECTIONS.RESTAURANTS)
-      .find(
-        { status: { $in: ['approved', 'terminated'] } },
-        { projection: { 
-          password: 0, 
-          loginAttempts: 0, 
-          lockUntil: 0,
-          contratPDF: 0
-        }}
-      )
-      .toArray();
-    
+    const restaurants = await db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $in: ['approved', 'terminated'] } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } }).toArray();
     res.json(restaurants);
-  } catch (e) {
-    console.error('Erreur getRestaurants:', e.message);
-    res.json([]);
-  }
+  } catch (e) { res.json([]); }
 });
-
-app.get('/api/restaurants/qr/:qrCode', async (req, res) => {
-  const restaurant = await getRestaurantByQRCode(req.params.qrCode);
-  if (!restaurant || restaurant.status !== 'approved') {
-    return res.status(404).json({ error: 'Restaurant non trouvé' });
-  }
-  const { password, loginAttempts, lockUntil, ...data } = restaurant;
-  res.json(data);
-});
-app.get('/api/restaurants/siret/:siret', async (req, res) => {
-  const siret = req.params.siret.replace(/\D/g, '');
-  if (siret.length !== 14) {
-    return res.status(400).json({ error: 'SIRET invalide (14 chiffres requis)' });
-  }
-  if (!db || !isConnected) {
-    return res.status(503).json({ error: 'Base de données non disponible' });
-  }
-  const restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
-  if (!restaurant) {
-    return res.status(404).json({ error: 'Restaurant non trouvé', exists: false });
-  }
-  const { password, loginAttempts, lockUntil, ...data } = restaurant;
-  res.json({ ...data, exists: true });
-});
-app.post('/api/restaurants/:id/terminate', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reason } = req.body || {};
-    const restaurant = await getRestaurantById(id);
-    if (!restaurant) {
-      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
-    }
-    const dateTerminated = new Date().toISOString();
-    await updateRestaurant(id, {
-      status: 'terminated',
-      dateTerminated,
-      terminationReason: reason || 'Fin de contrat'
-    });
-    await auditLog('RESTAURANT_TERMINATED', id, { reason, dateTerminated }, req);
-    res.json({ success: true, dateTerminated, message: 'Contrat résilié avec succès' });
-  } catch (error) {
-    console.error('Erreur fin de contrat:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.post('/api/restaurants/:id/approve', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { qrCode, password, ...updateData } = sanitizeObject(req.body);
-    const restaurant = await getRestaurantById(id);
-    if (!restaurant) {
-      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
-    }
-    const updates = {
-      ...updateData,
-      status: 'approved',
-      qrCode: qrCode || restaurant.qrCode || `UCO-${Date.now()}`,
-      dateApproval: new Date().toISOString()
-    };
-    if (password && !restaurant.password) {
-      updates.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    }
-    await updateRestaurant(id, updates);
-    await auditLog('RESTAURANT_APPROVED', id, { qrCode: updates.qrCode }, req);
-    res.json({ success: true, qrCode: updates.qrCode });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.post('/api/restaurants/:id/reject', async (req, res) => {
-  const { id } = req.params;
-  await deleteRestaurant(id);
-  await auditLog('RESTAURANT_REJECTED', id, {}, req);
-  res.json({ success: true });
-});
-app.post('/api/restaurants', async (req, res) => {
-  try {
-    const { id, qrCode, ...data } = sanitizeObject(req.body);
-    const restaurantId = id || qrCode || uuidv4();
-    const existing = await getRestaurantById(restaurantId);
-    if (existing) {
-      return res.status(409).json({ success: false, error: 'QR Code déjà attribué' });
-    }
-    await addRestaurant({
-      ...data,
-      id: restaurantId,
-      qrCode: qrCode || restaurantId,
-      status: data.status || 'approved',
-      dateCreated: new Date().toISOString()
-    });
-    await auditLog('RESTAURANT_CREATED', restaurantId, {}, req);
-    res.status(201).json({ success: true, id: restaurantId, qrCode: qrCode || restaurantId });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.put('/api/restaurants/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const restaurant = await getRestaurantById(id);
-    if (!restaurant) {
-      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
-    }
-    await updateRestaurant(id, sanitizeObject(req.body));
-    await auditLog('RESTAURANT_UPDATED', id, {}, req);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.put('/api/restaurants/:id/password', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { password } = sanitizeObject(req.body);
-    if (!password || password.length < 8) {
-      return res.status(400).json({ success: false, error: 'Mot de passe invalide (min 8 caractères)' });
-    }
-    const restaurant = await getRestaurantById(id);
-    if (!restaurant) {
-      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
-    }
-    await updateRestaurant(id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) });
-    await auditLog('RESTAURANT_PASSWORD_CHANGED', id, {}, req);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
+app.get('/api/restaurants/qr/:qrCode', async (req, res) => { const r = await getRestaurantByQRCode(req.params.qrCode); if (!r || r.status !== 'approved') return res.status(404).json({ error: 'Restaurant non trouve' }); const { password, loginAttempts, lockUntil, ...data } = r; res.json(data); });
+app.get('/api/restaurants/siret/:siret', async (req, res) => { const siret = req.params.siret.replace(/\D/g, ''); if (siret.length !== 14) return res.status(400).json({ error: 'SIRET invalide' }); if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' }); const r = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret }); if (!r) return res.status(404).json({ error: 'Restaurant non trouve', exists: false }); const { password, loginAttempts, lockUntil, ...data } = r; res.json({ ...data, exists: true }); });
+app.post('/api/restaurants/:id/terminate', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); const dt = new Date().toISOString(); await updateRestaurant(req.params.id, { status: 'terminated', dateTerminated: dt, terminationReason: req.body?.reason || 'Fin de contrat' }); res.json({ success: true, dateTerminated: dt }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/restaurants/:id/approve', async (req, res) => { try { const { id } = req.params; const { qrCode, password, ...upd } = sanitizeObject(req.body); const r = await getRestaurantById(id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); const updates = { ...upd, status: 'approved', qrCode: qrCode || r.qrCode || 'UCO-' + Date.now(), dateApproval: new Date().toISOString() }; if (password && !r.password) updates.password = await bcrypt.hash(password, BCRYPT_ROUNDS); await updateRestaurant(id, updates); res.json({ success: true, qrCode: updates.qrCode }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/restaurants/:id/reject', async (req, res) => { await deleteRestaurant(req.params.id); res.json({ success: true }); });
+app.post('/api/restaurants', async (req, res) => { try { const { id, qrCode, ...data } = sanitizeObject(req.body); const rid = id || qrCode || uuidv4(); const existing = await getRestaurantById(rid); if (existing) return res.status(409).json({ success: false, error: 'QR Code deja attribue' }); await addRestaurant({ ...data, id: rid, qrCode: qrCode || rid, status: data.status || 'approved', dateCreated: new Date().toISOString() }); res.status(201).json({ success: true, id: rid, qrCode: qrCode || rid }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.put('/api/restaurants/:id', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, sanitizeObject(req.body)); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.put('/api/restaurants/:id/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.post('/api/restaurants/:id/change-password', async (req, res) => {
   try {
-    const { id } = req.params;
     const { oldPassword, newPassword } = sanitizeObject(req.body);
-    if (!oldPassword) {
-      return res.status(400).json({ success: false, error: 'Ancien mot de passe requis' });
-    }
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ success: false, error: 'Nouveau mot de passe invalide (min 6 caractères)' });
-    }
-    const restaurant = await getRestaurantById(id);
-    if (!restaurant) {
-      return res.status(404).json({ success: false, error: 'Restaurant non trouvé' });
-    }
-    let isOldPasswordValid = false;
-    if (restaurant.password) {
-      isOldPasswordValid = await bcrypt.compare(oldPassword, restaurant.password);
-    }
-    if (!isOldPasswordValid && restaurant.tempPassword) {
-      isOldPasswordValid = (oldPassword === restaurant.tempPassword);
-    }
-    if (!isOldPasswordValid) {
-      return res.status(401).json({ success: false, error: 'Ancien mot de passe incorrect' });
-    }
-    await updateRestaurant(id, { 
-      password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS),
-      tempPassword: null,
-      passwordChangedAt: new Date().toISOString()
-    });
-    await auditLog('RESTAURANT_PASSWORD_CHANGED', id, { method: 'user_change' }, req);
-    console.log('Mot de passe changé pour restaurant:', id);
-    res.json({ success: true, message: 'Mot de passe modifié avec succès' });
-  } catch (error) {
-    console.error('Erreur changement mot de passe:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+    if (!oldPassword) return res.status(400).json({ success: false, error: 'Ancien mot de passe requis' });
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ success: false, error: 'Nouveau mot de passe invalide' });
+    const r = await getRestaurantById(req.params.id);
+    if (!r) return res.status(404).json({ success: false, error: 'Non trouve' });
+    let isOldValid = false;
+    if (r.password) isOldValid = await bcrypt.compare(oldPassword, r.password);
+    if (!isOldValid && r.tempPassword) isOldValid = (oldPassword === r.tempPassword);
+    if (!isOldValid) return res.status(401).json({ success: false, error: 'Ancien mot de passe incorrect' });
+    await updateRestaurant(req.params.id, { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), tempPassword: null, passwordChangedAt: new Date().toISOString() });
+    res.json({ success: true, message: 'Mot de passe modifie avec succes' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-
-// =============================================
-// [OPTIMISÉ] COLLECTES - avec mode léger (sans signatures base64)
-// =============================================
+// ===== COLLECTES [FIX OOM] =====
 app.get('/api/collections', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    
-    // Mode léger: exclure les signatures base64 (économise ~80% de mémoire)
-    const projection = { 
-      colSignature: 0, 
-      restoSignature: 0
-    };
-    
-    const collections = await db.collection(COLLECTIONS.COLLECTIONS)
-      .find({}, { projection })
-      .sort({ createdAt: -1 })
-      .toArray();
-    
-    // S'assurer que chaque collecte a un champ 'date' (le frontend l'utilise pour filtrer)
-    const collectionsWithDate = collections.map(c => ({
-      ...c,
-      date: c.date || c.createdAt
-    }));
-    
-    res.json(collectionsWithDate);
-  } catch (e) {
-    console.error('Erreur getCollections:', e.message);
-    res.json([]);
-  }
+    const projection = { colSignature: 0, restoSignature: 0 };
+    // [FIX OOM] Limiter a 2000 collectes max en memoire
+    const collections = await db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection }).sort({ createdAt: -1 }).limit(2000).toArray();
+    res.json(collections.map(c => ({ ...c, date: c.date || c.createdAt })));
+  } catch (e) { res.json([]); }
 });
-
-// Route pour récupérer une collecte spécifique AVEC signatures (quand on en a besoin)
 app.get('/api/collections/:id', async (req, res) => {
   try {
-    if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectée' });
-    const { id } = req.params;
-    const collection = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ 
-      $or: [{ _id: sanitizeInput(id) }, { id: sanitizeInput(id) }] 
-    });
-    if (!collection) return res.status(404).json({ error: 'Collecte non trouvée' });
-    res.json(collection);
-  } catch (e) {
-    console.error('Erreur getCollection:', e.message);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
+    if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectee' });
+    const col = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ $or: [{ _id: sanitizeInput(req.params.id) }, { id: sanitizeInput(req.params.id) }] });
+    if (!col) return res.status(404).json({ error: 'Collecte non trouvee' });
+    res.json(col);
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
-
 app.post('/api/collections', async (req, res) => {
   try {
-    const collection = sanitizeObject({
-      ...req.body,
-      id: req.body.id || uuidv4()
-    });
+    const collection = sanitizeObject({ ...req.body, id: req.body.id || uuidv4() });
     await addCollection(collection);
     await auditLog('COLLECTION_CREATED', collection.id, { restaurantId: collection.restaurantId }, req);
     res.status(201).json({ success: true, id: collection.id });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-
-// =============================================
-// [OPTIMISÉ] TOURNÉES - avec mode léger (sans signatures embarquées)
-// =============================================
+// ===== TOURNEES [FIX OOM] =====
 app.get('/api/tournees', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    
-    // Exclure les signatures base64 embarquées dans les collectes des tournées
-    const projection = {
-      'collectes.colSignature': 0,
-      'collectes.restoSignature': 0
-    };
-    
-    const tournees = await db.collection(COLLECTIONS.TOURNEES)
-      .find({}, { projection })
-      .sort({ dateDepart: -1 })
-      .toArray();
-    
+    const projection = { 'collectes.colSignature': 0, 'collectes.restoSignature': 0 };
+    // [FIX OOM] Limiter a 500 tournees max en memoire
+    const tournees = await db.collection(COLLECTIONS.TOURNEES).find({}, { projection }).sort({ dateDepart: -1 }).limit(500).toArray();
     res.json(tournees);
-  } catch (e) {
-    console.error('Erreur getTournees:', e.message);
-    res.json([]);
-  }
+  } catch (e) { res.json([]); }
 });
-
-app.post('/api/tournees', async (req, res) => {
-  try {
-    const tournee = sanitizeObject({
-      ...req.body,
-      id: req.body.id || uuidv4()
-    });
-    await addTournee(tournee);
-    res.status(201).json({ success: true, id: tournee.id });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.put('/api/tournees/:id', async (req, res) => {
-  const { id } = req.params;
-  await updateTournee(id, sanitizeObject(req.body));
-  res.json({ success: true });
-});
-// ===== RAPPORTS DE TOURNÉES =====
-app.get('/api/rapports-tournees', async (req, res) => {
-  try {
-    if (!db || !isConnected) return res.json([]);
-    const rapports = await db.collection('rapports_tournees').find({}).sort({ createdAt: -1 }).limit(100).toArray();
-    res.json(rapports || []);
-  } catch (error) {
-    console.error('Erreur récupération rapports tournées:', error);
-    res.json([]);
-  }
-});
-app.post('/api/rapports-tournees', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non disponible' });
-    }
-    const rapport = sanitizeObject(req.body);
-    rapport.createdAt = rapport.createdAt || new Date().toISOString();
-    await db.collection('rapports_tournees').insertOne({
-      ...rapport,
-      _id: rapport.id || uuidv4()
-    });
-    console.log('📊 Nouveau rapport de tournée enregistré:', rapport.id);
-    res.status(201).json({ success: true, id: rapport.id });
-  } catch (error) {
-    console.error('Erreur création rapport tournée:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
+app.post('/api/tournees', async (req, res) => { try { const t = sanitizeObject({ ...req.body, id: req.body.id || uuidv4() }); await addTournee(t); res.status(201).json({ success: true, id: t.id }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.put('/api/tournees/:id', async (req, res) => { await updateTournee(req.params.id, sanitizeObject(req.body)); res.json({ success: true }); });
+// ===== RAPPORTS TOURNEES =====
+app.get('/api/rapports-tournees', async (req, res) => { try { if (!db || !isConnected) return res.json([]); const r = await db.collection('rapports_tournees').find({}).sort({ createdAt: -1 }).limit(100).toArray(); res.json(r || []); } catch (e) { res.json([]); } });
+app.post('/api/rapports-tournees', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' }); const r = sanitizeObject(req.body); r.createdAt = r.createdAt || new Date().toISOString(); await db.collection('rapports_tournees').insertOne({ ...r, _id: r.id || uuidv4() }); res.status(201).json({ success: true, id: r.id }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 // ===== SETTINGS =====
-app.get('/api/settings', async (req, res) => {
-  const settings = await getSettings();
-  const { admin, brevoApiKey, ...publicSettings } = settings;
-  publicSettings.brevoApiKey = brevoApiKey ? '••••••••••••••••' : '';
-  publicSettings.hasBrevoKey = !!brevoApiKey;
-  res.json(publicSettings);
-});
-app.put('/api/settings', async (req, res) => {
-  try {
-    const { brevoApiKey, ...otherSettings } = req.body;
-    const sanitizedSettings = sanitizeObject(otherSettings);
-    if (brevoApiKey) {
-      sanitizedSettings.brevoApiKey = brevoApiKey;
-    }
-    await updateSettings(sanitizedSettings);
-    await auditLog('SETTINGS_UPDATED', 'admin', { fields: Object.keys(req.body) }, req);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur sauvegarde settings:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
+app.get('/api/settings', async (req, res) => { const s = await getSettings(); const { admin, brevoApiKey, ...pub } = s; pub.brevoApiKey = brevoApiKey ? '••••••••••••••••' : ''; pub.hasBrevoKey = !!brevoApiKey; res.json(pub); });
+app.put('/api/settings', async (req, res) => { try { const { brevoApiKey, ...other } = req.body; const s = sanitizeObject(other); if (brevoApiKey) s.brevoApiKey = brevoApiKey; await updateSettings(s); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/admin/password', async (req, res) => {
   try {
     const { currentPassword, newPassword } = sanitizeObject(req.body);
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ success: false, error: 'Mots de passe requis' });
-    }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, error: 'Nouveau mot de passe trop court (min 8 caractères)' });
-    }
+    if (!currentPassword || !newPassword) return res.status(400).json({ success: false, error: 'Mots de passe requis' });
+    if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
     const admin = await getAdmin();
     const isValid = await bcrypt.compare(currentPassword, admin.password);
-    if (!isValid) {
-      await auditLog('ADMIN_PASSWORD_CHANGE_FAILED', admin.email, { reason: 'Invalid current password' }, req);
-      return res.status(401).json({ success: false, error: 'Mot de passe actuel incorrect' });
-    }
+    if (!isValid) return res.status(401).json({ success: false, error: 'Mot de passe actuel incorrect' });
     const settings = await getSettings();
-    await updateSettings({
-      ...settings,
-      admin: {
-        ...admin,
-        password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS)
-      }
-    });
-    await auditLog('ADMIN_PASSWORD_CHANGED', admin.email, {}, req);
+    await updateSettings({ ...settings, admin: { ...admin, password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) } });
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-// ===== EMAIL (Brevo) =====
+// ===== EMAIL =====
 app.post('/api/send-email', async (req, res) => {
   try {
     const { to, subject, htmlContent, html, senderName, attachment, content, title } = req.body;
-    if (!to || !subject) {
-      return res.status(400).json({ success: false, error: 'Paramètres manquants' });
-    }
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(to)) {
-      return res.status(400).json({ success: false, error: 'Email destinataire invalide' });
-    }
+    if (!to || !subject) return res.status(400).json({ success: false, error: 'Parametres manquants' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ success: false, error: 'Email invalide' });
     const settings = await getSettings();
-    const apiKey = settings.brevoApiKey;
-    if (!apiKey) {
-      return res.status(503).json({ success: false, error: 'Service email non configuré' });
-    }
-    let rawContent = content || htmlContent || html || '';
-    rawContent = rawContent
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, ' ');
-    let cleanContent = rawContent
-      .replace(/<!DOCTYPE[^>]*>/gi, '')
-      .replace(/<html[^>]*>/gi, '')
-      .replace(/<\/html>/gi, '')
-      .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
-      .replace(/<body[^>]*>/gi, '')
-      .replace(/<\/body>/gi, '')
-      .replace(/<meta[^>]*>/gi, '')
-      .trim();
+    if (!settings.brevoApiKey) return res.status(503).json({ success: false, error: 'Service email non configure' });
+    let rawContent = (content || htmlContent || html || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+    let cleanContent = rawContent.replace(/<!DOCTYPE[^>]*>/gi, '').replace(/<html[^>]*>/gi, '').replace(/<\/html>/gi, '').replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '').replace(/<body[^>]*>/gi, '').replace(/<\/body>/gi, '').replace(/<meta[^>]*>/gi, '').trim();
     const finalHtml = '<html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;padding:20px;">' + cleanContent + '</body></html>';
-    console.log('=== ENVOI EMAIL ===');
-    console.log('To:', to);
-    console.log('Subject:', subject);
-    const emailPayload = {
-      sender: { name: senderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' },
-      to: [{ email: to }],
-      subject: subject.substring(0, 200),
-      htmlContent: finalHtml
-    };
-    if (attachment && attachment.content && attachment.name) {
-      emailPayload.attachment = [{ content: attachment.content, name: attachment.name.substring(0, 100) }];
-    }
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'api-key': apiKey,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(emailPayload)
-    });
+    const emailPayload = { sender: { name: senderName || 'UCO AND CO', email: 'contact@uco-and-co.fr' }, to: [{ email: to }], subject: subject.substring(0, 200), htmlContent: finalHtml };
+    if (attachment && attachment.content && attachment.name) emailPayload.attachment = [{ content: attachment.content, name: attachment.name.substring(0, 100) }];
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', { method: 'POST', headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' }, body: JSON.stringify(emailPayload) });
     const responseData = await response.json();
-    if (response.ok) {
-      console.log('Email OK, messageId:', responseData.messageId);
-      res.json({ success: true, messageId: responseData.messageId });
-    } else {
-      console.error('Erreur Brevo:', responseData);
-      res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo' });
-    }
-  } catch (error) {
-    console.error('Erreur email:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+    if (response.ok) res.json({ success: true, messageId: responseData.messageId });
+    else res.status(502).json({ success: false, error: responseData.message || 'Erreur Brevo' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-// ===== SMS (Brevo) =====
+// ===== SMS =====
 app.post('/api/send-sms', async (req, res) => {
   try {
     const { to, message, content } = req.body;
     const smsMessage = message || content;
-    if (!to || !smsMessage) {
-      return res.status(400).json({ success: false, error: 'Paramètres manquants (to ou message)' });
-    }
+    if (!to || !smsMessage) return res.status(400).json({ success: false, error: 'Parametres manquants' });
     const settings = await getSettings();
-    if (!settings.brevoApiKey) {
-      return res.status(503).json({ success: false, error: 'Clé API Brevo non configurée' });
-    }
-    if (!settings.smsEnabled) {
-      return res.status(503).json({ success: false, error: 'SMS désactivé. Activez-le dans Paramètres.' });
-    }
+    if (!settings.brevoApiKey) return res.status(503).json({ success: false, error: 'Cle API Brevo non configuree' });
+    if (!settings.smsEnabled) return res.status(503).json({ success: false, error: 'SMS desactive' });
     let phoneNumber = typeof to === 'object' ? to.number : to;
     let countryCode = typeof to === 'object' ? to.countryCode : 'FR';
     phoneNumber = String(phoneNumber).replace(/[\s\.\-]/g, '');
     const prefixes = { 'FR': '+33', 'BE': '+32', 'CH': '+41', 'LU': '+352' };
     const prefix = prefixes[countryCode] || '+33';
-    if (!phoneNumber.startsWith('+')) {
-      phoneNumber = phoneNumber.startsWith('0') ? prefix + phoneNumber.slice(1) : prefix + phoneNumber;
-    }
-    const smsPayload = {
-      sender: 'UCOANDCO',
-      recipient: phoneNumber,
-      content: smsMessage.slice(0, 160)
-    };
-    const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'api-key': settings.brevoApiKey,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(smsPayload)
-    });
+    if (!phoneNumber.startsWith('+')) phoneNumber = phoneNumber.startsWith('0') ? prefix + phoneNumber.slice(1) : prefix + phoneNumber;
+    const response = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', { method: 'POST', headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' }, body: JSON.stringify({ sender: 'UCOANDCO', recipient: phoneNumber, content: smsMessage.slice(0, 160) }) });
     const responseData = await response.json();
-    if (response.ok) {
-      res.json({ success: true, messageId: responseData.messageId });
-    } else {
-      let errorMsg = responseData.message || 'Erreur SMS Brevo';
-      if (responseData.code === 'not_enough_credits') {
-        errorMsg = 'Crédits SMS insuffisants. Achetez des crédits sur Brevo.';
-      }
-      res.status(502).json({ success: false, error: errorMsg, code: responseData.code });
-    }
-  } catch (error) {
-    console.error('Erreur SMS:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur: ' + error.message });
-  }
+    if (response.ok) res.json({ success: true, messageId: responseData.messageId });
+    else res.status(502).json({ success: false, error: responseData.message || 'Erreur SMS', code: responseData.code });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 // ===== AUDIT LOGS =====
 app.get('/api/audit-logs', authenticateToken, requireRole('admin'), async (req, res) => {
   if (!db || !isConnected) return res.json([]);
-  try {
-    const { limit = 100, action, userId } = req.query;
-    const query = {};
-    if (action) query.action = action;
-    if (userId) query.userId = userId;
-    const logs = await db.collection(COLLECTIONS.AUDIT_LOGS)
-      .find(query)
-      .sort({ timestamp: -1 })
-      .limit(parseInt(limit))
-      .toArray();
-    res.json(logs);
-  } catch (e) {
-    console.error('Erreur audit logs:', e.message);
-    res.json([]);
-  }
+  try { const { limit = 100, action, userId } = req.query; const q = {}; if (action) q.action = action; if (userId) q.userId = userId; const logs = await db.collection(COLLECTIONS.AUDIT_LOGS).find(q).sort({ timestamp: -1 }).limit(parseInt(limit)).toArray(); res.json(logs); } catch (e) { res.json([]); }
 });
-
-// =============================================
-// [OPTIMISÉ] STATISTIQUES - Utilise aggregation MongoDB au lieu de tout charger
-// =============================================
+// ===== STATS [OPTIMISE] =====
 app.get('/api/stats', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 });
-    }
-    
-    const [restaurantCount, collectorCount, operatorCount, collectionCount, volumeAgg] = await Promise.all([
+    if (!db || !isConnected) return res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 });
+    const [rc, cc, oc, colc, va] = await Promise.all([
       db.collection(COLLECTIONS.RESTAURANTS).countDocuments({ status: 'approved' }),
       db.collection(COLLECTIONS.COLLECTORS).countDocuments({ status: 'approved' }),
       db.collection(COLLECTIONS.OPERATORS).countDocuments({ status: 'approved' }),
       db.collection(COLLECTIONS.COLLECTIONS).countDocuments(),
-      db.collection(COLLECTIONS.COLLECTIONS).aggregate([
-        { $group: { 
-          _id: null, 
-          totalVolume: { $sum: { $toDouble: { $ifNull: ['$quantite', 0] } } },
-          totalAmount: { $sum: { $toDouble: { $ifNull: ['$montant', 0] } } }
-        }}
-      ]).toArray()
+      db.collection(COLLECTIONS.COLLECTIONS).aggregate([{ $group: { _id: null, totalVolume: { $sum: { $toDouble: { $ifNull: ['$quantite', 0] } } }, totalAmount: { $sum: { $toDouble: { $ifNull: ['$montant', 0] } } } } }]).toArray()
     ]);
-    
-    const totals = volumeAgg[0] || { totalVolume: 0, totalAmount: 0 };
-    
-    res.json({
-      restaurants: restaurantCount,
-      collectors: collectorCount,
-      operators: operatorCount,
-      collections: collectionCount,
-      totalVolume: Math.round(totals.totalVolume * 100) / 100,
-      totalAmount: Math.round(totals.totalAmount * 100) / 100
-    });
-  } catch (e) {
-    console.error('Erreur stats:', e.message);
-    res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 });
-  }
+    const totals = va[0] || { totalVolume: 0, totalAmount: 0 };
+    res.json({ restaurants: rc, collectors: cc, operators: oc, collections: colc, totalVolume: Math.round(totals.totalVolume * 100) / 100, totalAmount: Math.round(totals.totalAmount * 100) / 100 });
+  } catch (e) { res.json({ restaurants: 0, collectors: 0, operators: 0, collections: 0, totalVolume: 0, totalAmount: 0 }); }
 });
-
 // ===== PARTENAIRES =====
-app.get('/api/partners', async (req, res) => {
-  try {
-    if (!db || !isConnected) return res.json([]);
-    const partners = await db.collection('partners').find({}).toArray();
-    res.json(partners);
-  } catch (error) {
-    console.error('Erreur GET partners:', error);
-    res.json([]);
-  }
-});
-app.post('/api/partners', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const partner = req.body;
-    if (!partner.id) {
-      partner.id = 'partner_' + Date.now();
-    }
-    partner.createdAt = new Date().toISOString();
-    await db.collection('partners').insertOne(partner);
-    console.log('✅ Nouveau partenaire créé:', partner.name);
-    res.json({ success: true, partner });
-  } catch (error) {
-    console.error('Erreur POST partner:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-app.put('/api/partners/:id', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    const updates = req.body;
-    updates.updatedAt = new Date().toISOString();
-    const result = await db.collection('partners').updateOne({ id: id }, { $set: updates });
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
-    }
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur PUT partner:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-app.delete('/api/partners/:id', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    const result = await db.collection('partners').deleteOne({ id: id });
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, error: 'Partenaire non trouvé' });
-    }
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur DELETE partner:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+app.get('/api/partners', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection('partners').find({}).toArray()); } catch (e) { res.json([]); } });
+app.post('/api/partners', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const p = req.body; if (!p.id) p.id = 'partner_' + Date.now(); p.createdAt = new Date().toISOString(); await db.collection('partners').insertOne(p); res.json({ success: true, partner: p }); } catch (e) { res.status(500).json({ success: false, error: e.message }); } });
+app.put('/api/partners/:id', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const u = req.body; u.updatedAt = new Date().toISOString(); const r = await db.collection('partners').updateOne({ id: req.params.id }, { $set: u }); if (r.matchedCount === 0) return res.status(404).json({ success: false }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
+app.delete('/api/partners/:id', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const r = await db.collection('partners').deleteOne({ id: req.params.id }); if (r.deletedCount === 0) return res.status(404).json({ success: false }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
 // ===== PRESTATAIRES =====
 const SERVICES_DISPONIBLES = [
-  { id: 'bac_graisse', name: 'Entretien bac à graisse', icon: '🪣' },
-  { id: 'hotte', name: 'Nettoyage hotte aspiration', icon: '🌀' },
-  { id: 'extincteur', name: 'Installation extincteurs', icon: '🧯' },
-  { id: 'deratisation', name: 'Dératisation', icon: '🐀' },
-  { id: 'haccp', name: 'Formation HACCP', icon: '📋' },
-  { id: 'frigoriste', name: 'Frigoriste', icon: '❄️' },
-  { id: 'matieres_premieres', name: 'Livraison matières premières', icon: '🛒' },
-  { id: 'comptable', name: 'Expert-comptable', icon: '📊' },
-  { id: 'avocat', name: 'Avocat', icon: '⚖️' },
-  { id: 'assurance', name: 'Assurance', icon: '🛡️' },
-  { id: 'electricien', name: 'Électricien', icon: '⚡' },
-  { id: 'plombier', name: 'Plombier', icon: '🔧' },
-  { id: 'nettoyage', name: 'Nettoyage professionnel', icon: '🧹' },
-  { id: 'securite', name: 'Sécurité incendie', icon: '🔥' },
+  { id: 'bac_graisse', name: 'Entretien bac a graisse', icon: '🪣' }, { id: 'hotte', name: 'Nettoyage hotte', icon: '🌀' },
+  { id: 'extincteur', name: 'Extincteurs', icon: '🧯' }, { id: 'deratisation', name: 'Deratisation', icon: '🐀' },
+  { id: 'haccp', name: 'Formation HACCP', icon: '📋' }, { id: 'frigoriste', name: 'Frigoriste', icon: '❄️' },
+  { id: 'matieres_premieres', name: 'Matieres premieres', icon: '🛒' }, { id: 'comptable', name: 'Expert-comptable', icon: '📊' },
+  { id: 'avocat', name: 'Avocat', icon: '⚖️' }, { id: 'assurance', name: 'Assurance', icon: '🛡️' },
+  { id: 'electricien', name: 'Electricien', icon: '⚡' }, { id: 'plombier', name: 'Plombier', icon: '🔧' },
+  { id: 'nettoyage', name: 'Nettoyage pro', icon: '🧹' }, { id: 'securite', name: 'Securite incendie', icon: '🔥' },
   { id: 'autre', name: 'Autre service', icon: '📦' }
 ];
-app.get('/api/services-disponibles', (req, res) => {
-  res.json(SERVICES_DISPONIBLES);
-});
-app.get('/api/prestataires', async (req, res) => {
-  try {
-    if (!db || !isConnected) return res.json([]);
-    const prestataires = await db.collection(COLLECTIONS.PRESTATAIRES).find({}).toArray();
-    res.json(prestataires || []);
-  } catch (error) {
-    console.error('Erreur récupération prestataires:', error);
-    res.json([]);
-  }
-});
-app.get('/api/prestataires/:id', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    const prestataire = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({
-      $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }]
-    });
-    if (!prestataire) {
-      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
-    }
-    res.json(prestataire);
-  } catch (error) {
-    console.error('Erreur récupération prestataire:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
+app.get('/api/services-disponibles', (req, res) => { res.json(SERVICES_DISPONIBLES); });
+app.get('/api/prestataires', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection(COLLECTIONS.PRESTATAIRES).find({}).toArray() || []); } catch (e) { res.json([]); } });
+app.get('/api/prestataires/:id', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const p = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }); if (!p) return res.status(404).json({ success: false }); res.json(p); } catch (e) { res.status(500).json({ success: false }); } });
 app.post('/api/prestataires', async (req, res) => {
   try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
+    if (!db || !isConnected) return res.status(503).json({ success: false });
     const data = sanitizeObject(req.body);
-    if (!data.enseigne) {
-      return res.status(400).json({ success: false, error: 'Enseigne requise' });
-    }
-    if (!data.email) {
-      return res.status(400).json({ success: false, error: 'Email requis' });
-    }
-    if (!data.services || data.services.length === 0) {
-      return res.status(400).json({ success: false, error: 'Au moins un service requis' });
-    }
-    if (data.siret && data.siret !== 'EN_COURS') {
-      const existingBySiret = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ siret: data.siret });
-      if (existingBySiret) {
-        return res.status(409).json({ success: false, error: 'Un prestataire avec ce SIRET existe déjà' });
-      }
-    }
-    const existingByEmail = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ email: data.email });
-    if (existingByEmail) {
-      return res.status(409).json({ success: false, error: 'Un prestataire avec cet email existe déjà' });
-    }
-    const prestataireId = 'PREST_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    const newPrestataire = {
-      ...data,
-      id: prestataireId,
-      _id: prestataireId,
-      dateCreation: new Date().toISOString(),
-      status: 'active',
-      createdBy: req.body.createdBy || 'admin'
-    };
-    await db.collection(COLLECTIONS.PRESTATAIRES).insertOne(newPrestataire);
-    await auditLog('PRESTATAIRE_CREATE', prestataireId, { enseigne: data.enseigne, services: data.services }, req);
-    res.status(201).json({ success: true, id: prestataireId, prestataire: newPrestataire });
-  } catch (error) {
-    console.error('Erreur création prestataire:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
+    if (!data.enseigne) return res.status(400).json({ success: false, error: 'Enseigne requise' });
+    if (!data.email) return res.status(400).json({ success: false, error: 'Email requis' });
+    if (!data.services || data.services.length === 0) return res.status(400).json({ success: false, error: 'Service requis' });
+    if (data.siret && data.siret !== 'EN_COURS') { const ex = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ siret: data.siret }); if (ex) return res.status(409).json({ success: false, error: 'SIRET deja utilise' }); }
+    const exEmail = await db.collection(COLLECTIONS.PRESTATAIRES).findOne({ email: data.email }); if (exEmail) return res.status(409).json({ success: false, error: 'Email deja utilise' });
+    const pid = 'PREST_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    const np = { ...data, id: pid, _id: pid, dateCreation: new Date().toISOString(), status: 'active', createdBy: req.body.createdBy || 'admin' };
+    await db.collection(COLLECTIONS.PRESTATAIRES).insertOne(np);
+    res.status(201).json({ success: true, id: pid, prestataire: np });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.put('/api/prestataires/:id', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    const data = sanitizeObject(req.body);
-    delete data._id;
-    data.updatedAt = new Date().toISOString();
-    const result = await db.collection(COLLECTIONS.PRESTATAIRES).updateOne(
-      { $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }] },
-      { $set: data }
-    );
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
-    }
-    await auditLog('PRESTATAIRE_UPDATE', id, { fields: Object.keys(data) }, req);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur mise à jour prestataire:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    const result = await db.collection(COLLECTIONS.PRESTATAIRES).deleteOne({
-      $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }]
-    });
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, error: 'Prestataire non trouvé' });
-    }
-    await auditLog('PRESTATAIRE_DELETE', id, {}, req);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur suppression prestataire:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.get('/api/prestataires/service/:serviceId', async (req, res) => {
-  try {
-    if (!db || !isConnected) return res.json([]);
-    const { serviceId } = req.params;
-    const prestataires = await db.collection(COLLECTIONS.PRESTATAIRES).find({
-      services: sanitizeInput(serviceId),
-      status: 'active'
-    }).toArray();
-    res.json(prestataires || []);
-  } catch (error) {
-    console.error('Erreur récupération prestataires par service:', error);
-    res.json([]);
-  }
-});
-// ===== AVIS CLIENTS =====
-app.get('/api/avis', async (req, res) => {
-  try {
-    if (!db || !isConnected) return res.json([]);
-    const avis = await db.collection(COLLECTIONS.AVIS).find({}).sort({ dateCreation: -1 }).toArray();
-    res.json(avis || []);
-  } catch (error) {
-    console.error('Erreur récupération avis:', error);
-    res.json([]);
-  }
-});
-app.post('/api/avis', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const avisData = sanitizeObject(req.body);
-    if (!avisData.id) {
-      avisData.id = 'avis_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    }
-    avisData.dateCreation = avisData.dateCreation || new Date().toISOString();
-    await db.collection(COLLECTIONS.AVIS).insertOne({ ...avisData, _id: avisData.id });
-    res.status(201).json({ success: true, id: avisData.id });
-  } catch (error) {
-    console.error('Erreur création avis:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.delete('/api/avis/:id', authenticateToken, async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    await db.collection(COLLECTIONS.AVIS).deleteOne({ id: sanitizeInput(id) });
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur suppression avis:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.post('/api/avis/:id/read', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const { id } = req.params;
-    await db.collection(COLLECTIONS.AVIS).updateOne(
-      { $or: [{ id: sanitizeInput(id) }, { _id: sanitizeInput(id) }] },
-      { $set: { isRead: true, readAt: new Date().toISOString() } }
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erreur marquage avis lu:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-app.post('/api/avis/mark-all-read', async (req, res) => {
-  try {
-    if (!db || !isConnected) {
-      return res.status(503).json({ success: false, error: 'Base de données non connectée' });
-    }
-    const result = await db.collection(COLLECTIONS.AVIS).updateMany(
-      { isRead: { $ne: true } },
-      { $set: { isRead: true, readAt: new Date().toISOString() } }
-    );
-    res.json({ success: true, count: result.modifiedCount });
-  } catch (error) {
-    console.error('Erreur marquage tous avis lus:', error);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
-  }
-});
-// ===== STRIPE - PAIEMENTS ABONNEMENTS =====
-const STRIPE_PLANS = {
-  starter: { name: 'Starter', price: 0, stripePriceId: null },
-  simple: { name: 'Simple', price: 1499, stripePriceId: null },
-  premium: { name: 'Premium', price: 1999, stripePriceId: null }
-};
+app.put('/api/prestataires/:id', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const data = sanitizeObject(req.body); delete data._id; data.updatedAt = new Date().toISOString(); const r = await db.collection(COLLECTIONS.PRESTATAIRES).updateOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }, { $set: data }); if (r.matchedCount === 0) return res.status(404).json({ success: false }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
+app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const r = await db.collection(COLLECTIONS.PRESTATAIRES).deleteOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }); if (r.deletedCount === 0) return res.status(404).json({ success: false }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
+app.get('/api/prestataires/service/:serviceId', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection(COLLECTIONS.PRESTATAIRES).find({ services: sanitizeInput(req.params.serviceId), status: 'active' }).toArray() || []); } catch (e) { res.json([]); } });
+// ===== AVIS =====
+app.get('/api/avis', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection(COLLECTIONS.AVIS).find({}).sort({ dateCreation: -1 }).toArray() || []); } catch (e) { res.json([]); } });
+app.post('/api/avis', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const a = sanitizeObject(req.body); if (!a.id) a.id = 'avis_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9); a.dateCreation = a.dateCreation || new Date().toISOString(); await db.collection(COLLECTIONS.AVIS).insertOne({ ...a, _id: a.id }); res.status(201).json({ success: true, id: a.id }); } catch (e) { res.status(500).json({ success: false }); } });
+app.delete('/api/avis/:id', authenticateToken, async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).deleteOne({ id: sanitizeInput(req.params.id) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
+app.post('/api/avis/:id/read', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).updateOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }, { $set: { isRead: true, readAt: new Date().toISOString() } }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
+app.post('/api/avis/mark-all-read', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const r = await db.collection(COLLECTIONS.AVIS).updateMany({ isRead: { $ne: true } }, { $set: { isRead: true, readAt: new Date().toISOString() } }); res.json({ success: true, count: r.modifiedCount }); } catch (e) { res.status(500).json({ success: false }); } });
+// ===== STRIPE =====
+const STRIPE_PLANS = { starter: { name: 'Starter', price: 0, stripePriceId: null }, simple: { name: 'Simple', price: 1499, stripePriceId: null }, premium: { name: 'Premium', price: 1999, stripePriceId: null } };
 async function initializeStripePrices(stripe) {
   try {
     const products = await stripe.products.list({ limit: 10 });
     for (const [planId, plan] of Object.entries(STRIPE_PLANS)) {
       if (plan.price === 0) continue;
       let product = products.data.find(p => p.metadata?.planId === planId);
-      if (!product) {
-        product = await stripe.products.create({
-          name: `Abonnement UCO ${plan.name}`,
-          description: `Services partenaires UCO AND CO - Formule ${plan.name}`,
-          metadata: { planId }
-        });
-        console.log(`✅ Produit Stripe créé: ${plan.name}`);
-      }
+      if (!product) product = await stripe.products.create({ name: 'Abonnement UCO ' + plan.name, description: 'Services partenaires UCO AND CO - Formule ' + plan.name, metadata: { planId } });
       const prices = await stripe.prices.list({ product: product.id, limit: 5 });
       let price = prices.data.find(p => p.recurring?.interval === 'month' && p.unit_amount === plan.price);
-      if (!price) {
-        price = await stripe.prices.create({
-          product: product.id,
-          unit_amount: plan.price,
-          currency: 'eur',
-          recurring: { interval: 'month' },
-          metadata: { planId }
-        });
-        console.log(`✅ Prix Stripe créé: ${plan.name} - ${plan.price/100}€/mois`);
-      }
+      if (!price) price = await stripe.prices.create({ product: product.id, unit_amount: plan.price, currency: 'eur', recurring: { interval: 'month' }, metadata: { planId } });
       STRIPE_PLANS[planId].stripePriceId = price.id;
       STRIPE_PLANS[planId].stripeProductId = product.id;
     }
-    console.log('✅ Prix Stripe initialisés');
-  } catch (error) {
-    console.error('⚠️ Erreur initialisation prix Stripe:', error.message);
-  }
+    console.log('Prix Stripe initialises');
+  } catch (e) { console.error('Erreur init Stripe:', e.message); }
 }
 app.post('/api/stripe/create-subscription', async (req, res) => {
   try {
     const { restaurantId, plan, email, enseigne, siret } = req.body;
-    console.log('📦 Création abonnement:', { restaurantId, plan, email, enseigne });
     const stripe = await getStripe();
-    if (!stripe) {
-      return res.status(400).json({ success: false, error: 'Stripe non configuré' });
-    }
-    if (plan === 'starter' || STRIPE_PLANS[plan]?.price === 0) {
-      return res.json({ success: true, free: true, message: 'Formule gratuite - pas de paiement requis' });
-    }
-    if (!STRIPE_PLANS[plan]) {
-      return res.status(400).json({ success: false, error: `Plan inconnu: ${plan}` });
-    }
-    if (!STRIPE_PLANS[plan].stripePriceId) {
-      await initializeStripePrices(stripe);
-    }
-    const planConfig = STRIPE_PLANS[plan];
-    if (!planConfig?.stripePriceId) {
+    if (!stripe) return res.status(400).json({ success: false, error: 'Stripe non configure' });
+    if (plan === 'starter' || STRIPE_PLANS[plan]?.price === 0) return res.json({ success: true, free: true });
+    if (!STRIPE_PLANS[plan]) return res.status(400).json({ success: false, error: 'Plan inconnu: ' + plan });
+    if (!STRIPE_PLANS[plan].stripePriceId) await initializeStripePrices(stripe);
+    if (!STRIPE_PLANS[plan]?.stripePriceId) {
       try {
-        const product = await stripe.products.create({
-          name: `Abonnement UCO ${planConfig.name}`,
-          description: `Services partenaires UCO AND CO - Formule ${planConfig.name}`,
-          metadata: { planId: plan }
-        });
-        const price = await stripe.prices.create({
-          product: product.id,
-          unit_amount: planConfig.price,
-          currency: 'eur',
-          recurring: { interval: 'month' },
-          metadata: { planId: plan }
-        });
-        STRIPE_PLANS[plan].stripePriceId = price.id;
-        STRIPE_PLANS[plan].stripeProductId = product.id;
-      } catch (createError) {
-        console.error('❌ Erreur création prix:', createError.message);
-        return res.status(400).json({ success: false, error: 'Erreur création prix Stripe: ' + createError.message });
-      }
+        const product = await stripe.products.create({ name: 'Abonnement UCO ' + STRIPE_PLANS[plan].name, metadata: { planId: plan } });
+        const price = await stripe.prices.create({ product: product.id, unit_amount: STRIPE_PLANS[plan].price, currency: 'eur', recurring: { interval: 'month' }, metadata: { planId: plan } });
+        STRIPE_PLANS[plan].stripePriceId = price.id; STRIPE_PLANS[plan].stripeProductId = product.id;
+      } catch (ce) { return res.status(400).json({ success: false, error: 'Erreur prix Stripe: ' + ce.message }); }
     }
-    if (!STRIPE_PLANS[plan].stripePriceId) {
-      return res.status(400).json({ success: false, error: 'Impossible de configurer le prix Stripe' });
-    }
+    if (!STRIPE_PLANS[plan].stripePriceId) return res.status(400).json({ success: false, error: 'Impossible configurer prix' });
     let customer;
-    const existingCustomers = await stripe.customers.list({ email, limit: 1 });
-    if (existingCustomers.data.length > 0) {
-      customer = existingCustomers.data[0];
-      await stripe.customers.update(customer.id, { name: enseigne, metadata: { restaurantId, siret } });
-    } else {
-      customer = await stripe.customers.create({ email, name: enseigne, metadata: { restaurantId, siret } });
-    }
-    const session = await stripe.checkout.sessions.create({
-      customer: customer.id,
-      payment_method_types: ['card'],
-      mode: 'subscription',
-      line_items: [{ price: STRIPE_PLANS[plan].stripePriceId, quantity: 1 }],
-      subscription_data: { metadata: { restaurantId, siret, plan } },
-      success_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.headers.origin || 'https://uco-and-co.fr'}?subscription=cancelled`,
-      metadata: { restaurantId, siret, plan },
-      payment_method_collection: 'always'
-    });
-    console.log(`✅ Session Stripe créée: ${session.id} pour ${enseigne} (${plan})`);
+    const ec = await stripe.customers.list({ email, limit: 1 });
+    if (ec.data.length > 0) { customer = ec.data[0]; await stripe.customers.update(customer.id, { name: enseigne, metadata: { restaurantId, siret } }); }
+    else customer = await stripe.customers.create({ email, name: enseigne, metadata: { restaurantId, siret } });
+    const session = await stripe.checkout.sessions.create({ customer: customer.id, payment_method_types: ['card'], mode: 'subscription', line_items: [{ price: STRIPE_PLANS[plan].stripePriceId, quantity: 1 }], subscription_data: { metadata: { restaurantId, siret, plan } }, success_url: (req.headers.origin || 'https://uco-and-co.fr') + '?subscription=success&session_id={CHECKOUT_SESSION_ID}', cancel_url: (req.headers.origin || 'https://uco-and-co.fr') + '?subscription=cancelled', metadata: { restaurantId, siret, plan }, payment_method_collection: 'always' });
     res.json({ success: true, sessionId: session.id, url: session.url });
-  } catch (error) {
-    console.error('Erreur création subscription Stripe:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
-app.post('/api/stripe/create-checkout-session', async (req, res) => {
-  req.body.plan = req.body.plan || 'simple';
-  return res.redirect(307, '/api/stripe/create-subscription');
-});
+app.post('/api/stripe/create-checkout-session', async (req, res) => { req.body.plan = req.body.plan || 'simple'; return res.redirect(307, '/api/stripe/create-subscription'); });
 app.post('/api/stripe/webhook', async (req, res) => {
   try {
     const settings = await getSettings();
-    if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) {
-      return res.status(400).json({ error: 'Stripe non configuré' });
-    }
+    if (!settings?.stripeSecretKey || !settings?.stripeWebhookSecret) return res.status(400).json({ error: 'Stripe non configure' });
     const stripe = await getStripe();
-    if (!stripe) return res.status(400).json({ error: 'Stripe non configuré' });
-    const sig = req.headers['stripe-signature'];
+    if (!stripe) return res.status(400).json({ error: 'Stripe non configure' });
     let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, settings.stripeWebhookSecret);
-    } catch (err) {
-      console.error('❌ Erreur signature webhook:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-    console.log(`📥 Webhook Stripe reçu: ${event.type}`);
+    try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], settings.stripeWebhookSecret); } catch (err) { return res.status(400).send('Webhook Error: ' + err.message); }
+    console.log('Webhook Stripe recu: ' + event.type);
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
         const { restaurantId, siret, plan } = session.metadata || {};
-        if (!restaurantId && !siret) {
-          console.error('❌ Aucun identifiant restaurant dans les metadata');
-          break;
-        }
+        if (!restaurantId && !siret) break;
         let cardLast4 = '****';
-        if (session.subscription) {
-          try {
-            const subscription = await stripe.subscriptions.retrieve(session.subscription);
-            if (subscription.default_payment_method) {
-              const pm = await stripe.paymentMethods.retrieve(subscription.default_payment_method);
-              cardLast4 = pm.card?.last4 || '****';
-            }
-          } catch (e) { console.log('⚠️ Impossible de récupérer la carte:', e.message); }
-        }
-        const searchCriteria = [];
-        if (restaurantId) {
-          searchCriteria.push({ id: restaurantId });
-          searchCriteria.push({ qrCode: restaurantId });
-        }
-        if (siret) searchCriteria.push({ siret: siret });
-        if (session.customer_email) searchCriteria.push({ email: session.customer_email });
-        if (db && isConnected) {
-          const updateResult = await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-            { $or: searchCriteria },
-            {
-              $set: {
-                subscription: {
-                  plan: plan || 'simple',
-                  status: 'active',
-                  stripeCustomerId: session.customer,
-                  stripeSubscriptionId: session.subscription,
-                  startDate: new Date().toISOString(),
-                  lastPaymentDate: new Date().toISOString(),
-                  cardLast4
-                }
-              }
-            }
-          );
-          if (updateResult.matchedCount === 0) {
-            console.error('❌ Aucun restaurant trouvé avec les critères:', searchCriteria);
-          } else {
-            console.log(`✅ Abonnement ${plan} activé pour: ${restaurantId || siret}`);
-          }
-        }
+        if (session.subscription) { try { const sub = await stripe.subscriptions.retrieve(session.subscription); if (sub.default_payment_method) { const pm = await stripe.paymentMethods.retrieve(sub.default_payment_method); cardLast4 = pm.card?.last4 || '****'; } } catch (e) {} }
+        const sc = []; if (restaurantId) { sc.push({ id: restaurantId }); sc.push({ qrCode: restaurantId }); } if (siret) sc.push({ siret }); if (session.customer_email) sc.push({ email: session.customer_email });
+        if (db && isConnected) { await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ $or: sc }, { $set: { subscription: { plan: plan || 'simple', status: 'active', stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, startDate: new Date().toISOString(), lastPaymentDate: new Date().toISOString(), cardLast4 } } }); }
         break;
       }
-      case 'invoice.payment_succeeded': {
-        const invoice = event.data.object;
-        if (invoice.subscription && invoice.billing_reason !== 'subscription_create' && db && isConnected) {
-          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-            { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { $set: { 'subscription.lastPaymentDate': new Date().toISOString(), 'subscription.status': 'active' } }
-          );
-        }
-        break;
-      }
-      case 'invoice.payment_failed': {
-        const invoice = event.data.object;
-        if (invoice.subscription && db && isConnected) {
-          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-            { 'subscription.stripeSubscriptionId': invoice.subscription },
-            { 
-              $set: { 'subscription.status': 'payment_failed', 'subscription.lastFailedAt': new Date().toISOString() },
-              $inc: { 'subscription.failedAttempts': 1 }
-            }
-          );
-        }
-        break;
-      }
-      case 'customer.subscription.deleted': {
-        const subscription = event.data.object;
-        if (db && isConnected) {
-          await db.collection(COLLECTIONS.RESTAURANTS).updateOne(
-            { 'subscription.stripeSubscriptionId': subscription.id },
-            { $set: { 'subscription.status': 'cancelled', 'subscription.endDate': new Date().toISOString() } }
-          );
-        }
-        break;
-      }
+      case 'invoice.payment_succeeded': { const inv = event.data.object; if (inv.subscription && inv.billing_reason !== 'subscription_create' && db && isConnected) await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ 'subscription.stripeSubscriptionId': inv.subscription }, { $set: { 'subscription.lastPaymentDate': new Date().toISOString(), 'subscription.status': 'active' } }); break; }
+      case 'invoice.payment_failed': { const inv = event.data.object; if (inv.subscription && db && isConnected) await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ 'subscription.stripeSubscriptionId': inv.subscription }, { $set: { 'subscription.status': 'payment_failed', 'subscription.lastFailedAt': new Date().toISOString() }, $inc: { 'subscription.failedAttempts': 1 } }); break; }
+      case 'customer.subscription.deleted': { const sub = event.data.object; if (db && isConnected) await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ 'subscription.stripeSubscriptionId': sub.id }, { $set: { 'subscription.status': 'cancelled', 'subscription.endDate': new Date().toISOString() } }); break; }
     }
     res.json({ received: true });
-  } catch (error) {
-    console.error('Erreur webhook Stripe:', error);
-    res.status(500).json({ error: error.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/stripe/cancel-subscription', async (req, res) => {
-  try {
-    const { subscriptionId } = req.body;
-    const stripe = await getStripe();
-    if (!stripe) return res.status(400).json({ success: false, error: 'Stripe non configuré' });
-    const subscription = await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
-    res.json({ success: true, subscription });
-  } catch (error) {
-    console.error('Erreur annulation abonnement:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-app.post('/api/stripe/customer-portal', async (req, res) => {
-  try {
-    const { customerId } = req.body;
-    const stripe = await getStripe();
-    if (!stripe) return res.status(400).json({ success: false, error: 'Stripe non configuré' });
-    const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: `${req.headers.origin || 'https://uco-and-co.fr'}`
-    });
-    res.json({ success: true, url: session.url });
-  } catch (error) {
-    console.error('Erreur portail client:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-// ===== QONTO - FACTURES =====
+app.post('/api/stripe/cancel-subscription', async (req, res) => { try { const stripe = await getStripe(); if (!stripe) return res.status(400).json({ success: false }); const sub = await stripe.subscriptions.update(req.body.subscriptionId, { cancel_at_period_end: true }); res.json({ success: true, subscription: sub }); } catch (e) { res.status(500).json({ success: false, error: e.message }); } });
+app.post('/api/stripe/customer-portal', async (req, res) => { try { const stripe = await getStripe(); if (!stripe) return res.status(400).json({ success: false }); const session = await stripe.billingPortal.sessions.create({ customer: req.body.customerId, return_url: req.headers.origin || 'https://uco-and-co.fr' }); res.json({ success: true, url: session.url }); } catch (e) { res.status(500).json({ success: false, error: e.message }); } });
+// ===== QONTO =====
 app.post('/api/qonto/configure', async (req, res) => {
   try {
     const { organizationId, secretKey } = req.body;
-    if (!organizationId || !secretKey) {
-      return res.status(400).json({ success: false, error: 'Organization ID et Secret Key requis' });
-    }
-    const qontoAuth = `${organizationId}:${secretKey}`;
-    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
-      headers: { 'Authorization': qontoAuth, 'Content-Type': 'application/json' }
-    });
-    if (!testResponse.ok) {
-      return res.status(400).json({ success: false, error: 'Identifiants Qonto invalides' });
-    }
+    if (!organizationId || !secretKey) return res.status(400).json({ success: false, error: 'ID et Secret Key requis' });
+    const qontoAuth = organizationId + ':' + secretKey;
+    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', { headers: { 'Authorization': qontoAuth, 'Content-Type': 'application/json' } });
+    if (!testResponse.ok) return res.status(400).json({ success: false, error: 'Identifiants Qonto invalides' });
     const orgData = await testResponse.json();
-    if (db && isConnected) {
-      await db.collection('settings').updateOne(
-        {},
-        { $set: { qontoOrganizationId: organizationId, qontoSecretKey: secretKey, qontoOrganizationName: orgData.organization?.name } },
-        { upsert: true }
-      );
-    }
-    console.log('✅ Qonto configuré pour:', orgData.organization?.name);
+    if (db && isConnected) await db.collection('settings').updateOne({}, { $set: { qontoOrganizationId: organizationId, qontoSecretKey: secretKey, qontoOrganizationName: orgData.organization?.name } }, { upsert: true });
     res.json({ success: true, organizationName: orgData.organization?.name });
-  } catch (error) {
-    console.error('Erreur configuration Qonto:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 app.get('/api/qonto/status', async (req, res) => {
   try {
     const settings = await getSettings();
-    if (!settings?.qontoOrganizationId) {
-      return res.json({ success: true, configured: false });
-    }
-    const qontoAuth = `${settings.qontoOrganizationId}:${settings.qontoSecretKey}`;
-    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', {
-      headers: { 'Authorization': qontoAuth, 'Content-Type': 'application/json' }
-    });
-    const connected = testResponse.ok;
-    res.json({ 
-      success: true, 
-      configured: true,
-      connected,
-      organizationName: settings.qontoOrganizationName
-    });
-  } catch (error) {
-    console.error('Erreur statut Qonto:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+    if (!settings?.qontoOrganizationId) return res.json({ success: true, configured: false });
+    const testResponse = await fetch('https://thirdparty.qonto.com/v2/organization', { headers: { 'Authorization': settings.qontoOrganizationId + ':' + settings.qontoSecretKey, 'Content-Type': 'application/json' } });
+    res.json({ success: true, configured: true, connected: testResponse.ok, organizationName: settings.qontoOrganizationName });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 // ===== GESTION DES ERREURS =====
 app.use((err, req, res, next) => {
-  console.error(`[${req.requestId}] Erreur:`, err.message);
-  if (err.message === 'Non autorisé par CORS') {
-    return res.status(403).json({ success: false, error: 'Accès non autorisé' });
-  }
+  console.error('[' + req.requestId + '] Erreur:', err.message);
+  if (err.message === 'Non autorise par CORS') return res.status(403).json({ success: false, error: 'Acces non autorise' });
   res.status(500).json({ success: false, error: 'Erreur serveur interne' });
 });
-// Route 404
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: 'Route non trouvée' });
-});
+app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
+
+// [FIX OOM] Nettoyage periodique des tournees abandonnees (>48h)
+setInterval(async () => {
+  if (!db || !isConnected) return;
+  try {
+    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteMany({ lastUpdate: { $lt: cutoff } });
+    if (result.deletedCount > 0) console.log('Nettoyage: ' + result.deletedCount + ' tournee(s) abandonnee(s) supprimee(s)');
+  } catch (e) { console.log('Erreur nettoyage:', e.message); }
+}, 6 * 60 * 60 * 1000);
+
 // =============================================
-// DÉMARRAGE DU SERVEUR
+// DEMARRAGE DU SERVEUR
 // =============================================
 async function startServer() {
   await connectDB();
-  
   try {
     const settings = await getSettings();
     if (settings?.stripeSecretKey && settings?.stripeEnabled) {
-      console.log('🔄 Initialisation des prix Stripe...');
+      console.log('Initialisation des prix Stripe...');
       const stripe = await getStripe();
-      if (stripe) {
-        await initializeStripePrices(stripe);
-        console.log('✅ Prix Stripe initialisés:', {
-          simple: STRIPE_PLANS.simple.stripePriceId ? '✅' : '❌',
-          premium: STRIPE_PLANS.premium.stripePriceId ? '✅' : '❌'
-        });
-      }
-    } else {
-      console.log('⚠️ Stripe non configuré ou désactivé');
-    }
-  } catch (stripeError) {
-    console.error('⚠️ Erreur initialisation Stripe:', stripeError.message);
-  }
-  
+      if (stripe) { await initializeStripePrices(stripe); console.log('Prix Stripe initialises:', { simple: STRIPE_PLANS.simple.stripePriceId ? 'OK' : 'NON', premium: STRIPE_PLANS.premium.stripePriceId ? 'OK' : 'NON' }); }
+    } else { console.log('Stripe non configure ou desactive'); }
+  } catch (e) { console.error('Erreur init Stripe:', e.message); }
   app.listen(PORT, () => {
     console.log('');
-    console.log('🛢️  ========================================');
-    console.log('🛢️  UCO AND CO - Backend API (OPTIMISÉ)');
-    console.log('🛢️  ========================================');
-    console.log(`🚀 Serveur démarré sur le port ${PORT}`);
-    console.log(`📊 Base de données: ${isConnected ? 'MongoDB Atlas ✅' : 'Mode mémoire ⚠️'}`);
-    console.log('🔒 Sécurité activée:');
-    console.log('   ✅ Helmet (Headers sécurisés)');
-    console.log('   ✅ CORS restreint');
-    console.log('   ✅ Rate limiting');
-    console.log('   ✅ Sanitization NoSQL/XSS');
-    console.log('   ✅ JWT Authentication');
-    console.log('   ✅ Bcrypt (12 rounds)');
-    console.log('   ✅ Verrouillage de compte');
-    console.log('   ✅ Audit logs');
-    console.log('   ✅ Reconnexion auto MongoDB');
-    console.log('   ✅ Anti-crash global');
-    console.log('⚡ Optimisations mémoire:');
-    console.log('   ✅ Compression gzip');
-    console.log('   ✅ Collections: signatures base64 exclues');
-    console.log('   ✅ Tournées: signatures exclues');
-    console.log('   ✅ Stats: aggregation MongoDB');
-    console.log('   ✅ Restaurants: projection (sans PDFs)');
-    console.log('   ✅ Stripe: instance singleton');
-    console.log(`   📊 Mémoire: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
+    console.log('========================================');
+    console.log('UCO AND CO - Backend API (OPTIMISE)');
+    console.log('========================================');
+    console.log('Serveur demarre sur le port ' + PORT);
+    console.log('Base de donnees: ' + (isConnected ? 'MongoDB Atlas OK' : 'Mode memoire'));
+    console.log('Securite: Helmet, CORS, Rate limiting, Sanitization, JWT, Bcrypt, Audit logs');
+    console.log('Optimisations memoire:');
+    console.log('  - Compression gzip');
+    console.log('  - Collections: signatures exclues + limit 2000');
+    console.log('  - Tournees: signatures exclues + limit 500');
+    console.log('  - Stats: aggregation MongoDB');
+    console.log('  - Restaurants: projection sans PDFs');
+    console.log('  - Stripe: instance singleton');
+    console.log('  - Monitoring memoire proactif (30s)');
+    console.log('  - TTL indexes (tournees 7j, audit 90j)');
+    console.log('  - Nettoyage tournees abandonnees (6h)');
+    console.log('  - POST tournees/en-cours: payload check + no sanitize');
+    console.log('  Memoire: ' + Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB');
     console.log('');
   });
 }
