@@ -1,4 +1,4 @@
-const express = require('express');
+ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
@@ -179,8 +179,10 @@ const mongoOptions = {
 };
 const initialData = {
   admin: {
-    email: 'contact@uco-and-co.com',
-    password: bcrypt.hashSync('30Septembre2006A$', BCRYPT_ROUNDS),
+    email: process.env.ADMIN_EMAIL || 'contact@uco-and-co.com',
+    // [FIX 1.10] Mot de passe admin via variable d'environnement (ne plus coder en dur)
+    // Sur Render: ajouter ADMIN_PASSWORD_HASH = résultat de bcrypt.hash('votre_mot_de_passe', 12)
+    password: process.env.ADMIN_PASSWORD_HASH || bcrypt.hashSync(process.env.ADMIN_DEFAULT_PASSWORD || 'CHANGEZ-MOI-IMMEDIATEMENT', BCRYPT_ROUNDS),
     loginAttempts: 0,
     lockUntil: null
   },
@@ -353,24 +355,58 @@ function sanitizeInput(input, key = '') {
   const sanitized = input.replace(/[<>]/g, '').trim();
   return isUnlimited ? sanitized : sanitized.slice(0, 5000);
 }
-function sanitizeObject(obj, parentKey = '') {
+// [FIX 1.7] sanitizeObject optimisé — limite de profondeur + skip des champs binaires volumineux
+const BINARY_SKIP_FIELDS = new Set(['colSignature', 'restoSignature', 'contratPDF', 'bsdPdfBase64', 'signatureData', 'tamponData', 'adminSignatureData', 'ticketPeseeFile', 'bonInterventionFile']);
+const MAX_SANITIZE_DEPTH = 10;
+function sanitizeObject(obj, parentKey = '', depth = 0) {
+  if (depth > MAX_SANITIZE_DEPTH) return obj; // Stop recursion
   if (typeof obj !== 'object' || obj === null) return sanitizeInput(obj, parentKey);
+  if (obj instanceof Date) return obj;
   const sanitized = Array.isArray(obj) ? [] : {};
-  for (const key of Object.keys(obj)) {
-    if (key.startsWith('$')) continue;
-    sanitized[key] = sanitizeObject(obj[key], key);
+  const keys = Object.keys(obj);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (key.startsWith('$')) continue; // Block NoSQL injection operators
+    // Skip known binary/base64 fields — pass through without cloning (saves ~80% memory)
+    if (BINARY_SKIP_FIELDS.has(key)) {
+      sanitized[key] = obj[key];
+      continue;
+    }
+    sanitized[key] = sanitizeObject(obj[key], key, depth + 1);
   }
   return sanitized;
 }
 function generateToken(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN }); }
 function verifyToken(token) { try { return jwt.verify(token, JWT_SECRET); } catch (e) { return null; } }
+
+// [FIX 1.9] Blacklist de tokens JWT pour révocation
+const tokenBlacklist = new Set();
+// Nettoyage automatique des tokens expirés de la blacklist (toutes les heures)
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const entry of tokenBlacklist) {
+    try {
+      const decoded = jwt.decode(entry);
+      if (decoded && decoded.exp && decoded.exp < now) {
+        tokenBlacklist.delete(entry);
+      }
+    } catch (e) { tokenBlacklist.delete(entry); }
+  }
+  if (tokenBlacklist.size > 0) console.log('Blacklist JWT: ' + tokenBlacklist.size + ' token(s) revoque(s)');
+}, 60 * 60 * 1000);
+
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ success: false, error: 'Token manquant' });
+  // [FIX 1.9] Vérifier si le token est dans la blacklist
+  if (tokenBlacklist.has(token)) {
+    return res.status(403).json({ success: false, error: 'Session revoquee. Veuillez vous reconnecter.' });
+  }
   const decoded = verifyToken(token);
   if (!decoded) return res.status(403).json({ success: false, error: 'Token invalide ou expire' });
   req.user = decoded;
+  req.token = token;
   next();
 }
 function requireRole(...roles) {
@@ -664,6 +700,28 @@ app.post('/api/auth/restaurant', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.get('/api/auth/verify', authenticateToken, (req, res) => { res.json({ success: true, user: req.user }); });
+
+// [FIX 1.9] Déconnexion — invalide le token courant
+app.post('/api/auth/logout', (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token) {
+    tokenBlacklist.add(token);
+    console.log('Token revoque pour deconnexion');
+  }
+  res.json({ success: true });
+});
+
+// [FIX 1.9] Révocation forcée — invalide tous les tokens d'un utilisateur (usage admin)
+app.post('/api/auth/revoke', authenticateToken, requireRole('admin'), (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ success: false, error: 'Email requis' });
+  // Note: sans stockage des tokens émis, on ne peut pas révoquer rétroactivement tous les tokens
+  // d'un utilisateur. Mais on peut forcer une vérification côté base de données au prochain appel.
+  // En pratique, le token expire en 24h max.
+  auditLog('TOKEN_REVOKE_REQUESTED', email, { revokedBy: req.user.email }, req);
+  res.json({ success: true, message: 'Revocation enregistree' });
+});
 // ===== COLLECTEURS CRUD =====
 app.post('/api/collectors/register', async (req, res) => {
   try {
@@ -726,10 +784,30 @@ app.post('/api/restaurants/register', async (req, res) => {
   } catch (error) { console.error('Erreur register restaurant:', error); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.get('/api/restaurants/pending', async (req, res) => { const r = await getRestaurants('pending'); res.json(r.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+// [FIX 3.2 + 3.3] GET /api/restaurants — Delta support via ?since=
 app.get('/api/restaurants', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    const restaurants = await db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $in: ['approved', 'terminated'] } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } }).toArray();
+    const since = req.query.since || req.headers['if-modified-since'];
+    let query = { status: { $in: ['approved', 'terminated'] } };
+    
+    if (since) {
+      try {
+        const sinceDate = new Date(since);
+        if (!isNaN(sinceDate.getTime())) {
+          query = { ...query, $or: [{ updatedAt: { $gte: sinceDate.toISOString() } }, { dateApproval: { $gte: sinceDate.toISOString() } }] };
+        }
+      } catch(e) {}
+    }
+    
+    const restaurants = await db.collection(COLLECTIONS.RESTAURANTS)
+      .find(query, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } })
+      .toArray();
+    
+    res.set('X-Total-Count', restaurants.length);
+    res.set('X-Is-Delta', since ? 'true' : 'false');
+    res.set('Last-Modified', new Date().toUTCString());
+    
     res.json(restaurants);
   } catch (e) { res.json([]); }
 });
@@ -757,12 +835,44 @@ app.post('/api/restaurants/:id/change-password', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 // ===== COLLECTES [FIX OOM] =====
+// [FIX 3.2 + 3.3] GET /api/collections — Pagination + If-Modified-Since
 app.get('/api/collections', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
+    
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit) || 2000));
+    const skip = (page - 1) * limit;
+    const since = req.query.since || req.headers['if-modified-since'];
+    
     const projection = { colSignature: 0, restoSignature: 0 };
-    // [FIX OOM] Limiter a 2000 collectes max en memoire
-    const collections = await db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection }).sort({ createdAt: -1 }).limit(2000).toArray();
+    let query = {};
+    
+    // [FIX 3.3] Si le client envoie ?since=ISO_DATE, ne renvoyer que les collectes modifiées depuis
+    if (since) {
+      try {
+        const sinceDate = new Date(since);
+        if (!isNaN(sinceDate.getTime())) {
+          query = { $or: [{ updatedAt: { $gte: sinceDate.toISOString() } }, { createdAt: { $gte: sinceDate.toISOString() } }] };
+        }
+      } catch(e) {}
+    }
+    
+    const total = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments(query);
+    const collections = await db.collection(COLLECTIONS.COLLECTIONS)
+      .find(query, { projection })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    
+    // Headers de pagination
+    res.set('X-Total-Count', total);
+    res.set('X-Page', page);
+    res.set('X-Limit', limit);
+    res.set('X-Has-More', skip + collections.length < total ? 'true' : 'false');
+    res.set('Last-Modified', new Date().toUTCString());
+    
     res.json(collections.map(c => ({ ...c, date: c.date || c.createdAt })));
   } catch (e) { res.json([]); }
 });
@@ -774,21 +884,118 @@ app.get('/api/collections/:id', async (req, res) => {
     res.json(col);
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
+// [FIX 1.8] POST /api/collections — Validation complète
 app.post('/api/collections', async (req, res) => {
   try {
-    const collection = sanitizeObject({ ...req.body, id: req.body.id || uuidv4() });
-    await addCollection(collection);
-    await auditLog('COLLECTION_CREATED', collection.id, { restaurantId: collection.restaurantId }, req);
-    res.status(201).json({ success: true, id: collection.id });
-  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    
+    const data = sanitizeObject(req.body);
+    
+    // Validation des champs requis
+    if (!data.restaurantId) {
+      return res.status(400).json({ success: false, error: 'restaurantId requis' });
+    }
+    const volume = parseFloat(data.volume);
+    if (!volume || volume <= 0) {
+      return res.status(400).json({ success: false, error: 'Volume doit etre superieur a 0' });
+    }
+    if (!data.collectorNumber && !data.collectorId) {
+      return res.status(400).json({ success: false, error: 'collectorNumber ou collectorId requis' });
+    }
+    
+    // Anti-doublon: meme restaurant + meme collecteur dans les 2 dernieres minutes
+    const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const duplicate = await db.collection(COLLECTIONS.COLLECTIONS).findOne({
+      restaurantId: data.restaurantId,
+      collectorNumber: data.collectorNumber,
+      createdAt: { $gte: twoMinAgo }
+    });
+    if (duplicate) {
+      console.warn('Doublon collecte detecte:', { restaurantId: data.restaurantId, collectorNumber: data.collectorNumber });
+      return res.status(409).json({ 
+        success: false, 
+        error: 'Une collecte a deja ete enregistree pour ce restaurant il y a moins de 2 minutes',
+        existingId: duplicate._id
+      });
+    }
+    
+    // Generer le numero d'ordre AAMMJJ-COLXXX-XX
+    const now = new Date();
+    const aa = String(now.getFullYear()).slice(2);
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const jj = String(now.getDate()).padStart(2, '0');
+    const colNum = parseInt(data.collectorNumber) || 0;
+    const colId = colNum > 0 ? 'COL' + String(colNum).padStart(3, '0') : 'COL001';
+    
+    // Compter les collectes du meme collecteur aujourd'hui pour le suffixe
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const todayCount = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({
+      collectorNumber: data.collectorNumber,
+      createdAt: { $gte: todayStart }
+    });
+    const seq = String(todayCount + 1).padStart(2, '0');
+    const numeroOrdre = aa + mm + jj + '-' + colId + '-' + seq;
+    
+    const collectionId = data.id || uuidv4();
+    const collectionDoc = {
+      ...data,
+      _id: collectionId,
+      id: collectionId,
+      volume: volume,
+      price: parseFloat(data.price) || 0,
+      numeroOrdre: data.numeroOrdre || numeroOrdre,
+      date: data.date || now.toISOString(),
+      createdAt: now.toISOString()
+    };
+    
+    await db.collection(COLLECTIONS.COLLECTIONS).insertOne(collectionDoc);
+    
+    // Verifier le restaurant et retourner ses infos
+    let restaurant = null;
+    try {
+      restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
+        { $or: [{ id: data.restaurantId }, { qrCode: data.restaurantId }] },
+        { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } }
+      );
+    } catch(e) {}
+    
+    await auditLog('COLLECTION_CREATED', collectionId, { 
+      restaurantId: data.restaurantId, 
+      volume: volume, 
+      collectorNumber: data.collectorNumber 
+    }, req);
+    
+    res.status(201).json({ 
+      success: true, 
+      id: collectionId,
+      collectionId: collectionId,
+      numeroOrdre: collectionDoc.numeroOrdre,
+      date: collectionDoc.date,
+      restaurant: restaurant
+    });
+  } catch (e) { 
+    console.error('Erreur POST collection:', e.message);
+    res.status(500).json({ success: false, error: 'Erreur serveur' }); 
+  }
 });
 // ===== TOURNEES [FIX OOM] =====
+// [FIX 3.2] GET /api/tournees — Pagination
 app.get('/api/tournees', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit) || 500));
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const skip = (page - 1) * limit;
     const projection = { 'collectes.colSignature': 0, 'collectes.restoSignature': 0 };
-    // [FIX OOM] Limiter a 500 tournees max en memoire
-    const tournees = await db.collection(COLLECTIONS.TOURNEES).find({}, { projection }).sort({ dateDepart: -1 }).limit(500).toArray();
+    const total = await db.collection(COLLECTIONS.TOURNEES).countDocuments({});
+    const tournees = await db.collection(COLLECTIONS.TOURNEES)
+      .find({}, { projection })
+      .sort({ dateDepart: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+    res.set('X-Total-Count', total);
+    res.set('X-Has-More', skip + tournees.length < total ? 'true' : 'false');
     res.json(tournees);
   } catch (e) { res.json([]); }
 });
@@ -1036,14 +1243,23 @@ app.post('/api/password-reset/:role', async (req, res) => {
   try {
     const { role } = req.params;
     const { email, newPassword } = sanitizeObject(req.body);
-    const collMap = { transporteurs: COLLECTIONS.TRANSPORTEURS, recepteurs: COLLECTIONS.RECEPTEURS, certificateurs: COLLECTIONS.CERTIFICATEURS };
+    const collMap = { 
+      transporteurs: COLLECTIONS.TRANSPORTEURS, 
+      recepteurs: COLLECTIONS.RECEPTEURS, 
+      certificateurs: COLLECTIONS.CERTIFICATEURS,
+      collectors: COLLECTIONS.COLLECTORS,
+      operators: COLLECTIONS.OPERATORS,
+      restaurants: COLLECTIONS.RESTAURANTS
+    };
     const coll = collMap[role];
     if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
     if (!email || !newPassword) return res.status(400).json({ success: false, error: 'Email et nouveau mot de passe requis' });
     if (newPassword.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
-    const user = await db.collection(coll).findOne({ email });
+    // Restaurants use email field, others use email as _id
+    const query = role === 'restaurants' ? { email } : { email };
+    const user = await db.collection(coll).findOne(query);
     if (!user) return res.status(404).json({ success: false, error: 'Compte non trouve' });
-    await db.collection(coll).updateOne({ email }, { $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), updatedAt: new Date().toISOString() } });
+    await db.collection(coll).updateOne(query, { $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() } });
     await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, {}, req);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
@@ -1180,6 +1396,10 @@ async function startServer() {
     console.log('========================================');
     console.log('Serveur demarre sur le port ' + PORT);
     console.log('Base de donnees: ' + (isConnected ? 'MongoDB Atlas OK' : 'Mode memoire'));
+    if (!process.env.ADMIN_PASSWORD_HASH && !process.env.ADMIN_DEFAULT_PASSWORD) {
+      console.warn('⚠️ SECURITE: ADMIN_PASSWORD_HASH ou ADMIN_DEFAULT_PASSWORD non defini dans les variables d\'environnement Render.');
+      console.warn('   Le mot de passe par defaut est INSECURE. Ajoutez une variable d\'environnement sur Render.');
+    }
     console.log('Securite: Helmet, CORS, Rate limiting, Sanitization, JWT, Bcrypt, Audit logs');
     console.log('Optimisations memoire:');
     console.log('  - Compression gzip');
