@@ -212,7 +212,10 @@ const COLLECTIONS = {
   DOCUMENTS: 'documents',
   CAMPAIGNS: 'campaigns',
   TOURNEES_EN_COURS: 'tournees_en_cours',
-  AVIS: 'avis'
+  AVIS: 'avis',
+  TRANSPORTEURS: 'transporteurs',
+  RECEPTEURS: 'recepteurs',
+  CERTIFICATEURS: 'certificateurs'
 };
 const cache = {
   settings: null,
@@ -257,6 +260,10 @@ async function connectDB() {
       await db.collection(COLLECTIONS.TOURNEES_EN_COURS).createIndex({ lastUpdate: 1 }, { expireAfterSeconds: 604800 }).catch(() => {});
       // [FIX OOM] TTL index: auto-suppression audit logs apres 90 jours
       await db.collection(COLLECTIONS.AUDIT_LOGS).createIndex({ timestamp: 1 }, { expireAfterSeconds: 7776000 }).catch(() => {});
+      // Indexes transporteurs/recepteurs/certificateurs
+      await db.collection(COLLECTIONS.TRANSPORTEURS).createIndex({ email: 1 }, { unique: true, sparse: true }).catch(() => {});
+      await db.collection(COLLECTIONS.RECEPTEURS).createIndex({ email: 1 }, { unique: true, sparse: true }).catch(() => {});
+      await db.collection(COLLECTIONS.CERTIFICATEURS).createIndex({ email: 1 }, { unique: true, sparse: true }).catch(() => {});
     } catch (indexError) {
       console.warn('Erreur creation index:', indexError.message);
     }
@@ -313,6 +320,9 @@ app.use('/api/settings', checkDBConnection);
 app.use('/api/auth', checkDBConnection);
 app.use('/api/prestataires', checkDBConnection);
 app.use('/api/avis', checkDBConnection);
+app.use('/api/transporteurs', checkDBConnection);
+app.use('/api/recepteurs', checkDBConnection);
+app.use('/api/certificateurs', checkDBConnection);
 const stripeWebhook = require('./routes/stripe-webhook');
 app.use('/api/stripe', stripeWebhook);
 const demandesCollecteRoutes = require('./routes/demandes-collecte');
@@ -906,6 +916,139 @@ app.post('/api/avis', async (req, res) => { try { if (!db || !isConnected) retur
 app.delete('/api/avis/:id', authenticateToken, async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).deleteOne({ id: sanitizeInput(req.params.id) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
 app.post('/api/avis/:id/read', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).updateOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }, { $set: { isRead: true, readAt: new Date().toISOString() } }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
 app.post('/api/avis/mark-all-read', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const r = await db.collection(COLLECTIONS.AVIS).updateMany({ isRead: { $ne: true } }, { $set: { isRead: true, readAt: new Date().toISOString() } }); res.json({ success: true, count: r.modifiedCount }); } catch (e) { res.status(500).json({ success: false }); } });
+// =============================================
+// TRANSPORTEURS / RECEPTEURS / CERTIFICATEURS
+// =============================================
+// Helper function for generic role routes
+function createRoleRoutes(app, roleName, collectionName, numberField, numberPrefix) {
+  // Register
+  app.post('/api/' + roleName + '/register', async (req, res) => {
+    try {
+      const { email, password, ...data } = sanitizeObject(req.body);
+      if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+      if (!isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
+      const existing = await db.collection(collectionName).findOne({ email });
+      if (existing) return res.status(409).json({ success: false, error: 'Email deja utilise' });
+      await db.collection(collectionName).insertOne({
+        ...data, email, password: await bcrypt.hash(password, BCRYPT_ROUNDS),
+        _id: email, status: 'pending', loginAttempts: 0, lockUntil: null,
+        dateRequest: new Date().toISOString(), createdAt: new Date().toISOString()
+      });
+      await auditLog(roleName.toUpperCase() + '_REGISTER', email, { status: 'pending' }, req);
+      res.status(201).json({ success: true });
+    } catch (e) { console.error('Erreur register ' + roleName + ':', e.message); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // Auth
+  app.post('/api/auth/' + roleName, async (req, res) => {
+    try {
+      const { email, password } = sanitizeObject(req.body);
+      if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+      const user = await db.collection(collectionName).findOne({ email });
+      if (!user) return res.status(401).json({ success: false, error: 'Compte non trouve' });
+      if (user.status === 'pending') return res.json({ success: false, error: 'pending' });
+      if (user.status !== 'approved') return res.status(401).json({ success: false, error: 'Compte non approuve' });
+      if (isAccountLocked(user)) return res.status(423).json({ success: false, error: 'Compte verrouille' });
+      const isValid = await bcrypt.compare(password, user.password);
+      if (!isValid) {
+        await incrementLoginAttempts(collectionName, email);
+        return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+      }
+      await resetLoginAttempts(collectionName, email);
+      const token = generateToken({ role: roleName, email });
+      const { password: _, loginAttempts, lockUntil, ...data } = user;
+      await auditLog(roleName.toUpperCase() + '_LOGIN_SUCCESS', email, {}, req);
+      res.json({ success: true, role: roleName, data, token });
+    } catch (e) { console.error('Erreur auth ' + roleName + ':', e.message); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // List pending
+  app.get('/api/' + roleName + '/pending', async (req, res) => {
+    try {
+      if (!db || !isConnected) return res.json([]);
+      const items = await db.collection(collectionName).find({ status: 'pending' }).toArray();
+      res.json(items.map(({ password, loginAttempts, lockUntil, ...x }) => x));
+    } catch (e) { res.json([]); }
+  });
+
+  // List approved
+  app.get('/api/' + roleName + '/approved', async (req, res) => {
+    try {
+      if (!db || !isConnected) return res.json([]);
+      const items = await db.collection(collectionName).find({ status: 'approved' }).toArray();
+      res.json(items.map(({ password, loginAttempts, lockUntil, ...x }) => x));
+    } catch (e) { res.json([]); }
+  });
+
+  // Approve
+  app.post('/api/' + roleName + '/:email/approve', async (req, res) => {
+    try {
+      const { email } = req.params;
+      const existing = await db.collection(collectionName).find({ status: 'approved' }).toArray();
+      const nums = existing.filter(x => x[numberField]).map(x => x[numberField]);
+      let num = 1;
+      while (nums.includes(num)) num++;
+      await db.collection(collectionName).updateOne(
+        { email },
+        { $set: { status: 'approved', [numberField]: num, dateApproval: new Date().toISOString(), updatedAt: new Date().toISOString() } }
+      );
+      await auditLog(roleName.toUpperCase() + '_APPROVED', email, { [numberField]: num }, req);
+      res.json({ success: true, [numberField]: num, formatted: numberPrefix + '-' + String(num).padStart(3, '0') });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // Reject (delete pending)
+  app.post('/api/' + roleName + '/:email/reject', async (req, res) => {
+    try {
+      await db.collection(collectionName).deleteOne({ email: req.params.email });
+      await auditLog(roleName.toUpperCase() + '_REJECTED', req.params.email, {}, req);
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // Delete
+  app.delete('/api/' + roleName + '/:email', async (req, res) => {
+    try {
+      await db.collection(collectionName).deleteOne({ email: req.params.email });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // Update
+  app.put('/api/' + roleName + '/:email', async (req, res) => {
+    try {
+      const data = sanitizeObject(req.body);
+      delete data._id; delete data.password;
+      data.updatedAt = new Date().toISOString();
+      await db.collection(collectionName).updateOne({ email: req.params.email }, { $set: data });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+}
+
+// Create routes for all 3 roles
+createRoleRoutes(app, 'transporteurs', COLLECTIONS.TRANSPORTEURS, 'transporteurNumber', 'TRA');
+createRoleRoutes(app, 'recepteurs', COLLECTIONS.RECEPTEURS, 'recepteurNumber', 'REC');
+createRoleRoutes(app, 'certificateurs', COLLECTIONS.CERTIFICATEURS, 'certificateurNumber', 'CERT');
+
+// Password reset for transporteurs/recepteurs/certificateurs
+app.post('/api/password-reset/:role', async (req, res) => {
+  try {
+    const { role } = req.params;
+    const { email, newPassword } = sanitizeObject(req.body);
+    const collMap = { transporteurs: COLLECTIONS.TRANSPORTEURS, recepteurs: COLLECTIONS.RECEPTEURS, certificateurs: COLLECTIONS.CERTIFICATEURS };
+    const coll = collMap[role];
+    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (!email || !newPassword) return res.status(400).json({ success: false, error: 'Email et nouveau mot de passe requis' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
+    const user = await db.collection(coll).findOne({ email });
+    if (!user) return res.status(404).json({ success: false, error: 'Compte non trouve' });
+    await db.collection(coll).updateOne({ email }, { $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), updatedAt: new Date().toISOString() } });
+    await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, {}, req);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
 // ===== STRIPE =====
 const STRIPE_PLANS = { starter: { name: 'Starter', price: 0, stripePriceId: null }, simple: { name: 'Simple', price: 1499, stripePriceId: null }, premium: { name: 'Premium', price: 1999, stripePriceId: null } };
 async function initializeStripePrices(stripe) {
