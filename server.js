@@ -661,6 +661,37 @@ app.get('/api/health', (req, res) => {
     r2Storage: initS3() ? 'Cloudflare R2 connecte' : 'R2 non configure (signatures en MongoDB)'
   });
 });
+// [FIX 3.7] Error logging — Capture des erreurs frontend
+const errorLog = [];
+const MAX_ERROR_LOG = 200;
+
+app.post('/api/errors', (req, res) => {
+  const { message, stack, url, userAgent, user, timestamp } = req.body || {};
+  const entry = {
+    message: String(message || 'Unknown error').substring(0, 500),
+    stack: String(stack || '').substring(0, 1000),
+    url: String(url || '').substring(0, 200),
+    userAgent: String(userAgent || '').substring(0, 200),
+    user: String(user || 'anonymous').substring(0, 100),
+    timestamp: timestamp || new Date().toISOString(),
+    ip: req.ip
+  };
+  errorLog.unshift(entry);
+  if (errorLog.length > MAX_ERROR_LOG) errorLog.length = MAX_ERROR_LOG;
+  console.log('🔴 Frontend error:', entry.message, '—', entry.user);
+  res.json({ success: true });
+});
+
+app.get('/api/errors', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, MAX_ERROR_LOG);
+  res.json({ errors: errorLog.slice(0, limit), total: errorLog.length });
+});
+
+app.delete('/api/errors', (req, res) => {
+  errorLog.length = 0;
+  res.json({ success: true, message: 'Error log cleared' });
+});
+
 app.post('/api/test-email', async (req, res) => {
   try {
     const { to } = req.body;
@@ -1509,6 +1540,87 @@ app.get('/api/r2/status', (req, res) => {
     bucket: R2_BUCKET,
     hasCredentials: !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY)
   });
+});
+
+// [FIX 3.6] Archivage collectes > 1 an — libérer l'espace MongoDB
+app.post('/api/archive/collections', async (req, res) => {
+  if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectee' });
+  try {
+    const monthsOld = parseInt(req.query.months) || 12;
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - monthsOld);
+    const cutoffStr = cutoff.toISOString();
+    
+    // Compter les collectes à archiver
+    const toArchive = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({
+      createdAt: { $lt: cutoffStr },
+      _archived: { $ne: true }
+    });
+    
+    if (toArchive === 0) return res.json({ success: true, archived: 0, message: 'Aucune collecte a archiver' });
+    
+    // Copier vers la collection d'archive (sans signatures)
+    const oldCollections = await db.collection(COLLECTIONS.COLLECTIONS)
+      .find({ createdAt: { $lt: cutoffStr }, _archived: { $ne: true } })
+      .project({ colSignature: 0, restoSignature: 0 })
+      .limit(500)
+      .toArray();
+    
+    if (oldCollections.length > 0) {
+      // Insérer dans la collection archive
+      const archiveDocs = oldCollections.map(c => ({ ...c, _archivedAt: new Date().toISOString(), _originalCollection: 'collections' }));
+      await db.collection('archives_collections').insertMany(archiveDocs);
+      
+      // Marquer comme archivées (mais ne pas supprimer — sécurité)
+      const ids = oldCollections.map(c => c._id);
+      await db.collection(COLLECTIONS.COLLECTIONS).updateMany(
+        { _id: { $in: ids } },
+        { $set: { _archived: true, colSignature: null, restoSignature: null, _archivedAt: new Date().toISOString() } }
+      );
+    }
+    
+    await auditLog('ARCHIVE_COLLECTIONS', 'system', { archived: oldCollections.length, cutoff: cutoffStr, monthsOld }, req);
+    
+    // Stats d'espace libéré (estimation)
+    const avgSigSize = 150; // KB moyenne par signature
+    const freedKB = oldCollections.length * avgSigSize * 2; // 2 signatures par collecte
+    
+    res.json({
+      success: true,
+      archived: oldCollections.length,
+      remaining: toArchive - oldCollections.length,
+      freedEstimate: (freedKB / 1024).toFixed(1) + ' MB',
+      message: `${oldCollections.length} collecte(s) archivee(s). ~${(freedKB / 1024).toFixed(1)} MB liberes`
+    });
+  } catch (e) {
+    console.error('Erreur archivage:', e.message);
+    res.status(500).json({ error: 'Erreur archivage: ' + e.message });
+  }
+});
+
+// [FIX 3.6] Stats d'archivage
+app.get('/api/archive/stats', async (req, res) => {
+  if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectee' });
+  try {
+    const totalCollections = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({});
+    const archivedCollections = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({ _archived: true });
+    const archiveCount = await db.collection('archives_collections').countDocuments({});
+    
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - 12);
+    const oldCount = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({
+      createdAt: { $lt: cutoff.toISOString() },
+      _archived: { $ne: true }
+    });
+    
+    res.json({
+      totalCollections,
+      archivedInPlace: archivedCollections,
+      archivedSeparate: archiveCount,
+      eligibleForArchive: oldCount,
+      estimatedFreeable: (oldCount * 300 / 1024).toFixed(1) + ' MB'
+    });
+  } catch (e) { res.status(500).json({ error: 'Erreur' }); }
 });
 
 // ===== STRIPE =====
