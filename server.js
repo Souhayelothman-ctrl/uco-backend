@@ -13,6 +13,117 @@ const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const fetch = require('node-fetch');
 const compression = require('compression');
+
+// =============================================
+// [FIX 3.8] Stockage objet S3/R2 pour signatures et documents lourds
+// =============================================
+let s3Client = null;
+const R2_BUCKET = process.env.R2_BUCKET || 'uco-signatures';
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || ''; // URL publique si bucket public
+
+// Initialiser le client S3/R2 si configuré
+function initS3() {
+  if (s3Client) return s3Client;
+  const accountId = process.env.R2_ACCOUNT_ID;
+  const accessKey = process.env.R2_ACCESS_KEY_ID;
+  const secretKey = process.env.R2_SECRET_ACCESS_KEY;
+  if (!accountId || !accessKey || !secretKey) {
+    return null; // R2 non configuré — fallback MongoDB
+  }
+  try {
+    const { S3Client } = require('@aws-sdk/client-s3');
+    s3Client = new S3Client({
+      region: 'auto',
+      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: accessKey, secretAccessKey: secretKey }
+    });
+    console.log('✅ Cloudflare R2 connecte (bucket: ' + R2_BUCKET + ')');
+    return s3Client;
+  } catch (e) {
+    console.log('⚠️ @aws-sdk/client-s3 non installe — signatures en MongoDB (npm install @aws-sdk/client-s3)');
+    return null;
+  }
+}
+
+// Upload un blob base64 vers R2, retourne la clé
+async function uploadToR2(key, base64Data, contentType) {
+  const client = initS3();
+  if (!client) return null; // Fallback: pas de R2
+  try {
+    const { PutObjectCommand } = require('@aws-sdk/client-s3');
+    const buffer = Buffer.from(base64Data, 'base64');
+    await client.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType || 'image/png'
+    }));
+    console.log('☁️ Upload R2:', key, '(' + (buffer.length / 1024).toFixed(1) + ' KB)');
+    return key;
+  } catch (e) {
+    console.error('Erreur upload R2:', e.message);
+    return null;
+  }
+}
+
+// Télécharger depuis R2
+async function downloadFromR2(key) {
+  const client = initS3();
+  if (!client) return null;
+  try {
+    const { GetObjectCommand } = require('@aws-sdk/client-s3');
+    const resp = await client.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+    const chunks = [];
+    for await (const chunk of resp.Body) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  } catch (e) {
+    console.error('Erreur download R2:', e.message);
+    return null;
+  }
+}
+
+// Extraire les champs base64 d'un objet et les uploader vers R2
+// Retourne l'objet avec les champs remplacés par des clés R2
+async function extractAndUploadSignatures(obj, prefix) {
+  const client = initS3();
+  if (!client) return obj; // Pas de R2 → garder en MongoDB
+  
+  const fieldsToExtract = ['colSignature', 'restoSignature', 'contratPDF', 'bsdPdfBase64', 'signatureData'];
+  const result = { ...obj };
+  const r2Keys = {};
+  
+  for (const field of fieldsToExtract) {
+    if (result[field] && typeof result[field] === 'string' && result[field].length > 1000) {
+      // C'est un champ base64 volumineux
+      let base64 = result[field];
+      let contentType = 'application/octet-stream';
+      
+      // Extraire le type MIME si c'est un data URI
+      if (base64.startsWith('data:')) {
+        const match = base64.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          contentType = match[1];
+          base64 = match[2];
+        }
+      }
+      
+      const key = `${prefix}/${field}_${Date.now()}.${contentType.includes('pdf') ? 'pdf' : 'png'}`;
+      const uploaded = await uploadToR2(key, base64, contentType);
+      
+      if (uploaded) {
+        // Remplacer la valeur par une référence R2
+        result[field] = null; // Supprimer le base64
+        r2Keys[field] = { r2Key: key, contentType, size: base64.length };
+      }
+    }
+  }
+  
+  if (Object.keys(r2Keys).length > 0) {
+    result._r2 = { ...((result._r2) || {}), ...r2Keys };
+  }
+  
+  return result;
+}
 const app = express();
 const PORT = process.env.PORT || 3001;
 // =============================================
@@ -546,7 +657,8 @@ app.get('/api/health', (req, res) => {
       external: Math.round(mem.external / 1024 / 1024) + 'MB'
     },
     memoryWarnings: memoryWarningCount,
-    reconnectAttempts: reconnectAttempts
+    reconnectAttempts: reconnectAttempts,
+    r2Storage: initS3() ? 'Cloudflare R2 connecte' : 'R2 non configure (signatures en MongoDB)'
   });
 });
 app.post('/api/test-email', async (req, res) => {
@@ -881,6 +993,22 @@ app.get('/api/collections/:id', async (req, res) => {
     if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectee' });
     const col = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ $or: [{ _id: sanitizeInput(req.params.id) }, { id: sanitizeInput(req.params.id) }] });
     if (!col) return res.status(404).json({ error: 'Collecte non trouvee' });
+    
+    // [FIX 3.8] Si ?withSignatures=true et que les signatures sont sur R2, les reconstruire
+    if (req.query.withSignatures === 'true' && col._r2) {
+      for (const [field, info] of Object.entries(col._r2)) {
+        if (info.r2Key) {
+          try {
+            const buffer = await downloadFromR2(info.r2Key);
+            if (buffer) {
+              const prefix = info.contentType ? `data:${info.contentType};base64,` : 'data:image/png;base64,';
+              col[field] = prefix + buffer.toString('base64');
+            }
+          } catch(e) {}
+        }
+      }
+    }
+    
     res.json(col);
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
@@ -948,7 +1076,13 @@ app.post('/api/collections', async (req, res) => {
       createdAt: now.toISOString()
     };
     
-    await db.collection(COLLECTIONS.COLLECTIONS).insertOne(collectionDoc);
+    // [FIX 3.8] Extraire les signatures vers R2 si configuré
+    let finalDoc = collectionDoc;
+    try {
+      finalDoc = await extractAndUploadSignatures(collectionDoc, `collections/${collectionId}`);
+    } catch (e) { console.log('R2 extraction skipped:', e.message); }
+    
+    await db.collection(COLLECTIONS.COLLECTIONS).insertOne(finalDoc);
     
     // Verifier le restaurant et retourner ses infos
     let restaurant = null;
@@ -1263,6 +1397,118 @@ app.post('/api/password-reset/:role', async (req, res) => {
     await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, {}, req);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// [FIX 3.8] Endpoint pour télécharger une signature depuis R2
+app.get('/api/r2/:key(*)', async (req, res) => {
+  try {
+    const key = req.params.key;
+    const buffer = await downloadFromR2(key);
+    if (!buffer) return res.status(404).json({ error: 'Fichier non trouve' });
+    
+    // Déterminer le content-type depuis l'extension
+    const ext = key.split('.').pop();
+    const types = { png: 'image/png', jpg: 'image/jpeg', pdf: 'application/pdf' };
+    res.set('Content-Type', types[ext] || 'application/octet-stream');
+    res.set('Cache-Control', 'public, max-age=86400'); // Cache 24h
+    res.send(buffer);
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+// [FIX 3.8] Endpoint pour uploader un fichier vers R2
+app.post('/api/r2/upload', async (req, res) => {
+  try {
+    const { key, base64, contentType } = req.body;
+    if (!key || !base64) return res.status(400).json({ error: 'key et base64 requis' });
+    const uploaded = await uploadToR2(key, base64, contentType || 'image/png');
+    if (!uploaded) return res.status(503).json({ error: 'R2 non disponible' });
+    res.json({ success: true, key: uploaded, url: `${API_BASE_URL || ''}/api/r2/${uploaded}` });
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+// [FIX 3.8] Migration: extraire les signatures des collectes existantes vers R2
+app.post('/api/r2/migrate', async (req, res) => {
+  const client = initS3();
+  if (!client) return res.json({ success: false, error: 'R2 non configure', migrated: 0 });
+  if (!db || !isConnected) return res.status(503).json({ error: 'DB non connectee' });
+  
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    // Trouver les collectes qui ont encore des signatures en base64
+    const collectionsWithSig = await db.collection(COLLECTIONS.COLLECTIONS)
+      .find({
+        $or: [
+          { colSignature: { $exists: true, $ne: null, $not: { $size: 0 } } },
+          { restoSignature: { $exists: true, $ne: null, $not: { $size: 0 } } }
+        ],
+        '_r2.colSignature': { $exists: false }
+      })
+      .limit(limit)
+      .toArray();
+    
+    let migrated = 0;
+    let errors = 0;
+    
+    for (const col of collectionsWithSig) {
+      try {
+        const prefix = `collections/${col._id || col.id}`;
+        const r2Keys = {};
+        
+        for (const field of ['colSignature', 'restoSignature']) {
+          if (col[field] && typeof col[field] === 'string' && col[field].length > 1000) {
+            let base64 = col[field];
+            let contentType = 'image/png';
+            if (base64.startsWith('data:')) {
+              const match = base64.match(/^data:([^;]+);base64,(.+)$/);
+              if (match) { contentType = match[1]; base64 = match[2]; }
+            }
+            const key = `${prefix}/${field}.png`;
+            const uploaded = await uploadToR2(key, base64, contentType);
+            if (uploaded) {
+              r2Keys[field] = { r2Key: key, contentType, size: base64.length };
+            }
+          }
+        }
+        
+        if (Object.keys(r2Keys).length > 0) {
+          // Mettre à jour MongoDB: supprimer les base64, ajouter les clés R2
+          const update = { $set: { _r2: r2Keys }, $unset: {} };
+          for (const field of Object.keys(r2Keys)) {
+            update.$unset[field] = '';
+          }
+          await db.collection(COLLECTIONS.COLLECTIONS).updateOne({ _id: col._id }, update);
+          migrated++;
+        }
+      } catch (e) {
+        errors++;
+        console.log('Migration error for', col._id, ':', e.message);
+      }
+    }
+    
+    const remaining = await db.collection(COLLECTIONS.COLLECTIONS).countDocuments({
+      $or: [
+        { colSignature: { $exists: true, $ne: null } },
+        { restoSignature: { $exists: true, $ne: null } }
+      ],
+      '_r2.colSignature': { $exists: false }
+    });
+    
+    await auditLog('R2_MIGRATION', 'system', { migrated, errors, remaining }, req);
+    res.json({ success: true, migrated, errors, remaining, message: `${migrated} collecte(s) migrees, ${remaining} restante(s)` });
+  } catch (e) {
+    console.error('Migration R2 error:', e.message);
+    res.status(500).json({ error: 'Erreur migration' });
+  }
+});
+
+// [FIX 3.8] Status R2
+app.get('/api/r2/status', (req, res) => {
+  const client = initS3();
+  res.json({
+    configured: !!client,
+    bucket: R2_BUCKET,
+    hasCredentials: !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY)
+  });
 });
 
 // ===== STRIPE =====
