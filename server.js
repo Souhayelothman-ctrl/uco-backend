@@ -1628,9 +1628,14 @@ app.get('/api/archive/stats', async (req, res) => {
 
 // Rechercher une transaction Qonto par montant et date
 app.post('/api/qonto/find-transaction', async (req, res) => {
-  const { apiKey, slug, amount, dateFrom, dateTo, label } = req.body;
-  if (!apiKey || !slug) return res.status(400).json({ error: 'apiKey et slug requis' });
+  const { amount, dateFrom, dateTo, label } = req.body;
   try {
+    // Utiliser les credentials stockés en base (configurés via /api/qonto/configure)
+    const settings = await getSettings();
+    const apiKey = settings?.qontoSecretKey;
+    const slug = settings?.qontoOrganizationId;
+    if (!apiKey || !slug) return res.status(400).json({ error: 'Qonto non configure. Allez dans Parametres pour configurer.' });
+    
     const params = new URLSearchParams({
       slug,
       status: 'completed',
@@ -1650,7 +1655,7 @@ app.post('/api/qonto/find-transaction', async (req, res) => {
       return Math.abs(txAmount - targetAmount) <= 0.01;
     });
     
-    res.json({ transactions: matched.slice(0, 5), total: matched.length });
+    res.json({ transactions: matched.slice(0, 10), total: matched.length });
   } catch (e) {
     console.error('Qonto search error:', e.message);
     res.status(500).json({ error: 'Erreur Qonto: ' + e.message });
@@ -1659,10 +1664,15 @@ app.post('/api/qonto/find-transaction', async (req, res) => {
 
 // Joindre un PDF à une transaction Qonto
 app.post('/api/qonto/attach', async (req, res) => {
-  const { apiKey, slug, transactionId, pdfBase64, filename } = req.body;
-  if (!apiKey || !slug || !transactionId || !pdfBase64) return res.status(400).json({ error: 'Parametres manquants' });
+  const { transactionId, pdfBase64, filename } = req.body;
+  if (!transactionId || !pdfBase64) return res.status(400).json({ error: 'transactionId et pdfBase64 requis' });
   try {
-    // Étape 1: Upload le fichier
+    const settings = await getSettings();
+    const apiKey = settings?.qontoSecretKey;
+    const slug = settings?.qontoOrganizationId;
+    if (!apiKey || !slug) return res.status(400).json({ error: 'Qonto non configure' });
+    
+    // Upload le fichier
     const boundary = '----FormBoundary' + Date.now();
     const pdfBuffer = Buffer.from(pdfBase64, 'base64');
     
