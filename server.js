@@ -1623,6 +1623,81 @@ app.get('/api/archive/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur' }); }
 });
 
+// ===== QONTO — Joindre factures aux transactions =====
+// Proxy pour éviter CORS (frontend → backend → Qonto API)
+
+// Rechercher une transaction Qonto par montant et date
+app.post('/api/qonto/find-transaction', async (req, res) => {
+  const { apiKey, slug, amount, dateFrom, dateTo, label } = req.body;
+  if (!apiKey || !slug) return res.status(400).json({ error: 'apiKey et slug requis' });
+  try {
+    const params = new URLSearchParams({
+      slug,
+      status: 'completed',
+      ...(dateFrom && { settled_at_from: dateFrom }),
+      ...(dateTo && { settled_at_to: dateTo }),
+    });
+    const response = await fetch(`https://thirdparty.qonto.com/v2/transactions?${params}`, {
+      headers: { 'Authorization': `${slug}:${apiKey}` }
+    });
+    const data = await response.json();
+    if (!data.transactions) return res.json({ transactions: [], message: 'Aucune transaction trouvee' });
+    
+    // Filtrer par montant (tolérance 0.01€)
+    const targetAmount = Math.abs(parseFloat(amount));
+    const matched = data.transactions.filter(t => {
+      const txAmount = Math.abs(t.amount);
+      return Math.abs(txAmount - targetAmount) <= 0.01;
+    });
+    
+    res.json({ transactions: matched.slice(0, 5), total: matched.length });
+  } catch (e) {
+    console.error('Qonto search error:', e.message);
+    res.status(500).json({ error: 'Erreur Qonto: ' + e.message });
+  }
+});
+
+// Joindre un PDF à une transaction Qonto
+app.post('/api/qonto/attach', async (req, res) => {
+  const { apiKey, slug, transactionId, pdfBase64, filename } = req.body;
+  if (!apiKey || !slug || !transactionId || !pdfBase64) return res.status(400).json({ error: 'Parametres manquants' });
+  try {
+    // Étape 1: Upload le fichier
+    const boundary = '----FormBoundary' + Date.now();
+    const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+    
+    const body = [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="file"; filename="${filename || 'facture.pdf'}"`,
+      'Content-Type: application/pdf',
+      '',
+      pdfBuffer.toString('binary'),
+      `--${boundary}--`
+    ].join('\r\n');
+    
+    const uploadRes = await fetch(`https://thirdparty.qonto.com/v2/transactions/${transactionId}/attachments`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `${slug}:${apiKey}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`
+      },
+      body
+    });
+    
+    if (uploadRes.ok) {
+      const result = await uploadRes.json().catch(() => ({}));
+      await auditLog('QONTO_ATTACH', 'admin', { transactionId, filename }, req);
+      res.json({ success: true, message: 'Facture jointe a la transaction Qonto', result });
+    } else {
+      const errText = await uploadRes.text();
+      res.status(uploadRes.status).json({ error: 'Qonto upload error: ' + errText });
+    }
+  } catch (e) {
+    console.error('Qonto attach error:', e.message);
+    res.status(500).json({ error: 'Erreur: ' + e.message });
+  }
+});
+
 // ===== STRIPE =====
 const STRIPE_PLANS = { starter: { name: 'Starter', price: 0, stripePriceId: null }, simple: { name: 'Simple', price: 1499, stripePriceId: null }, premium: { name: 'Premium', price: 1999, stripePriceId: null } };
 async function initializeStripePrices(stripe) {
