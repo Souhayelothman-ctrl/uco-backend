@@ -328,7 +328,10 @@ const COLLECTIONS = {
   AVIS: 'avis',
   TRANSPORTEURS: 'transporteurs',
   RECEPTEURS: 'recepteurs',
-  CERTIFICATEURS: 'certificateurs'
+  CERTIFICATEURS: 'certificateurs',
+  DAILY_VOLUMES: 'daily_volumes',
+  EXPEDITIONS: 'expeditions',
+  VEHICLE_LOGS: 'vehicle_logs'
 };
 const cache = {
   settings: null,
@@ -767,6 +770,45 @@ app.post('/api/tournees/paused', async (req, res) => {
     res.json({ success: true, tourneeId: tourneeData.id });
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
+// ===== REGISTRE VÉHICULES (Contraventions) =====
+app.get('/api/vehicle-logs', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json([]);
+    const query = {};
+    if (req.query.immatriculation) query.immatriculation = { $regex: req.query.immatriculation.replace(/[-\s]/g, ''), $options: 'i' };
+    if (req.query.date) {
+      const d = new Date(req.query.date);
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+      query.dateDepart = { $gte: start.toISOString(), $lt: end.toISOString() };
+    }
+    if (req.query.from && req.query.to) {
+      query.dateDepart = { $gte: new Date(req.query.from).toISOString(), $lte: new Date(req.query.to).toISOString() };
+    }
+    const logs = await db.collection(COLLECTIONS.VEHICLE_LOGS).find(query).sort({ dateDepart: -1 }).limit(500).toArray();
+    res.json(logs);
+  } catch (e) { res.json([]); }
+});
+app.post('/api/vehicle-logs', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false });
+    const log = sanitizeObject(req.body);
+    if (!log.immatriculation || !log.collectorNumber) return res.status(400).json({ success: false, error: 'Immatriculation et collecteur requis' });
+    log.immatriculationNorm = (log.immatriculation || '').replace(/[-\s]/g, '').toUpperCase();
+    log.createdAt = new Date().toISOString();
+    await db.collection(COLLECTIONS.VEHICLE_LOGS).insertOne(log);
+    res.json({ success: true, id: log.id });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+app.put('/api/vehicle-logs/:id', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false });
+    const update = sanitizeObject(req.body);
+    await db.collection(COLLECTIONS.VEHICLE_LOGS).updateOne({ id: req.params.id }, { $set: update });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+
 // ===== AUTHENTIFICATION =====
 app.post('/api/auth/admin', async (req, res) => {
   try {
@@ -1284,6 +1326,53 @@ app.delete('/api/prestataires/:id', authenticateToken, async (req, res) => { try
 app.get('/api/prestataires/service/:serviceId', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection(COLLECTIONS.PRESTATAIRES).find({ services: sanitizeInput(req.params.serviceId), status: 'active' }).toArray() || []); } catch (e) { res.json([]); } });
 // ===== AVIS =====
 app.get('/api/avis', async (req, res) => { try { if (!db || !isConnected) return res.json([]); res.json(await db.collection(COLLECTIONS.AVIS).find({}).sort({ dateCreation: -1 }).toArray() || []); } catch (e) { res.json([]); } });
+
+// ===== DAILY VOLUMES =====
+app.get('/api/daily-volumes', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json([]);
+    const volumes = await db.collection(COLLECTIONS.DAILY_VOLUMES).find({}).sort({ date: -1 }).limit(500).toArray();
+    res.json(volumes || []);
+  } catch (e) { res.json([]); }
+});
+app.post('/api/daily-volumes', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    const data = sanitizeObject(req.body);
+    if (!data.date || !data.collectorId) return res.status(400).json({ success: false, error: 'date et collectorId requis' });
+    data.updatedAt = new Date().toISOString();
+    await db.collection(COLLECTIONS.DAILY_VOLUMES).updateOne(
+      { date: data.date, collectorId: data.collectorId },
+      { $set: data },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// ===== EXPEDITIONS =====
+app.get('/api/expeditions', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json([]);
+    const expeditions = await db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(500).toArray();
+    res.json(expeditions || []);
+  } catch (e) { res.json([]); }
+});
+app.post('/api/expeditions', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    const data = sanitizeObject(req.body);
+    if (!data.id) data.id = require('uuid').v4();
+    data.createdAt = data.createdAt || new Date().toISOString();
+    data.updatedAt = new Date().toISOString();
+    await db.collection(COLLECTIONS.EXPEDITIONS).updateOne(
+      { id: data.id },
+      { $set: data },
+      { upsert: true }
+    );
+    res.json({ success: true, id: data.id });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
 app.post('/api/avis', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); const a = sanitizeObject(req.body); if (!a.id) a.id = 'avis_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9); a.dateCreation = a.dateCreation || new Date().toISOString(); await db.collection(COLLECTIONS.AVIS).insertOne({ ...a, _id: a.id }); res.status(201).json({ success: true, id: a.id }); } catch (e) { res.status(500).json({ success: false }); } });
 app.delete('/api/avis/:id', authenticateToken, async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).deleteOne({ id: sanitizeInput(req.params.id) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
 app.post('/api/avis/:id/read', async (req, res) => { try { if (!db || !isConnected) return res.status(503).json({ success: false }); await db.collection(COLLECTIONS.AVIS).updateOne({ $or: [{ id: sanitizeInput(req.params.id) }, { _id: sanitizeInput(req.params.id) }] }, { $set: { isRead: true, readAt: new Date().toISOString() } }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false }); } });
