@@ -770,6 +770,23 @@ app.post('/api/tournees/paused', async (req, res) => {
     res.json({ success: true, tourneeId: tourneeData.id });
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
+// ===== ADMIN SETTINGS (backup date, etc.) =====
+app.get('/api/admin-settings', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json({});
+    const settings = await db.collection('admin_settings').findOne({ id: 'main' });
+    res.json(settings || {});
+  } catch (e) { res.json({}); }
+});
+app.put('/api/admin-settings', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false });
+    const update = sanitizeObject(req.body);
+    await db.collection('admin_settings').updateOne({ id: 'main' }, { $set: update }, { upsert: true });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false }); }
+});
+
 // ===== REGISTRE VÉHICULES (Contraventions) =====
 app.get('/api/vehicle-logs', async (req, res) => {
   try {
