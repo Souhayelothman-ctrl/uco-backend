@@ -645,12 +645,17 @@ app.get('/api/proxy/villes/:cp', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // [FIX OOM] Health check avec details memoire
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   const mem = process.memoryUsage();
-  res.status(200).json({
-    status: 'OK',
-    database: isConnected ? 'MongoDB Atlas' : 'MongoDB disconnected',
-    persistent: isConnected, secure: true,
+  // Vérifier que MongoDB est vraiment connecté (pas juste le flag)
+  let dbReady = false;
+  if (db && isConnected) {
+    try { await db.command({ ping: 1 }); dbReady = true; } catch(e) { dbReady = false; }
+  }
+  res.status(dbReady ? 200 : 503).json({
+    status: dbReady ? 'OK' : 'DB_NOT_READY',
+    database: dbReady ? 'MongoDB Atlas' : 'MongoDB connecting...',
+    persistent: dbReady, secure: true,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     memoryUsage: {
