@@ -770,6 +770,67 @@ app.post('/api/tournees/paused', async (req, res) => {
     res.json({ success: true, tourneeId: tourneeData.id });
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
+// ===== BULK DATA (1 seul appel pour tout charger — optimisation mobile) =====
+app.get('/api/bulk-data', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json({ success: false, error: 'DB not connected' });
+    const limit = parseInt(req.query.limit) || 500;
+    const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, pendingOperators, approvedOperators, expeditions, avisClients, adminSettings] = await Promise.all([
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'deleted' } }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.PENDING_RESTAURANTS).find({}).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.PENDING_OPERATORS || 'pending_operators').find({}).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.APPROVED_OPERATORS || 'approved_operators').find({}).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
+      db.collection('avis_clients').find({}).sort({ date: -1 }).limit(100).toArray().catch(() => []),
+      db.collection('admin_settings').findOne({ id: 'main' }).catch(() => null)
+    ]);
+    res.json({
+      success: true,
+      restaurants, pendingRestaurants, collections, 
+      pendingCollectors, approvedCollectors,
+      pendingOperators, approvedOperators,
+      expeditions, avisClients,
+      adminSettings: adminSettings || {},
+      _loadedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error('Bulk data error:', e.message);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// ===== BULK LOAD (optimisation mobile — tout en 1 requête) =====
+app.get('/api/bulk-load', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.json({ success: false });
+    const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, 
+           pendingOperators, approvedOperators, expeditions, demandesCollecte] = await Promise.all([
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }).limit(500).toArray(),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }).limit(100).toArray(),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).limit(2000).toArray(),
+      db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray(),
+      db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray(),
+      db.collection('pending_operators').find({}).limit(100).toArray(),
+      db.collection('approved_operators').find({}).limit(100).toArray(),
+      db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(500).toArray(),
+      db.collection('demandes_collecte').find({ status: { $in: ['pending', 'accepted'] } }).limit(200).toArray()
+    ]);
+    res.json({ 
+      success: true, 
+      restaurants, pendingRestaurants, collections, 
+      pendingCollectors, approvedCollectors,
+      pendingOperators, approvedOperators,
+      expeditions, demandesCollecte
+    });
+  } catch (e) { 
+    console.error('Bulk load error:', e.message);
+    res.json({ success: false }); 
+  }
+});
+
 // ===== ADMIN SETTINGS (backup date, etc.) =====
 app.get('/api/admin-settings', async (req, res) => {
   try {
