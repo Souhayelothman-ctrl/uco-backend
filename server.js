@@ -647,13 +647,14 @@ app.get('/api/proxy/villes/:cp', async (req, res) => {
 // [FIX OOM] Health check avec details memoire
 app.get('/api/health', async (req, res) => {
   const mem = process.memoryUsage();
-  // Vérifier que MongoDB est vraiment connecté (pas juste le flag)
+  // Tester MongoDB mais toujours répondre 200 (Express est dispo = backend dispo)
   let dbReady = false;
   if (db && isConnected) {
     try { await db.command({ ping: 1 }); dbReady = true; } catch(e) { dbReady = false; }
   }
-  res.status(dbReady ? 200 : 503).json({
-    status: dbReady ? 'OK' : 'DB_NOT_READY',
+  res.status(200).json({
+    status: dbReady ? 'OK' : 'DB_WARMING',
+    dbReady,
     database: dbReady ? 'MongoDB Atlas' : 'MongoDB connecting...',
     persistent: dbReady, secure: true,
     timestamp: new Date().toISOString(),
@@ -810,7 +811,13 @@ app.get('/api/bulk-data', async (req, res) => {
 // ===== BULK LOAD (optimisation mobile — tout en 1 requête) =====
 app.get('/api/bulk-load', async (req, res) => {
   try {
-    if (!db || !isConnected) return res.json({ success: false });
+    // Attendre que MongoDB soit prêt (max 10s)
+    let waitMs = 0;
+    while ((!db || !isConnected) && waitMs < 10000) {
+      await new Promise(r => setTimeout(r, 500));
+      waitMs += 500;
+    }
+    if (!db || !isConnected) return res.json({ success: false, reason: 'db_not_ready' });
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, 
            pendingOperators, approvedOperators, expeditions, demandesCollecte] = await Promise.all([
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }).limit(500).toArray(),
