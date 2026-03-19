@@ -820,14 +820,14 @@ app.get('/api/bulk-load', async (req, res) => {
     if (!db || !isConnected) return res.json({ success: false, reason: 'db_not_ready' });
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, 
            pendingOperators, approvedOperators, expeditions, demandesCollecte] = await Promise.all([
-      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }).limit(500).toArray(),
-      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }).limit(100).toArray(),
-      db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).limit(2000).toArray(),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }).limit(500).toArray(),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }).limit(100).toArray(),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0 } }).sort({ date: -1 }).limit(2000).toArray(),
       db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray(),
       db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray(),
       db.collection('pending_operators').find({}).limit(100).toArray(),
       db.collection('approved_operators').find({}).limit(100).toArray(),
-      db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(500).toArray(),
+      db.collection(COLLECTIONS.EXPEDITIONS).find({}, { projection: { bsdPdfBase64: 0, 'bsdCerfa.base64': 0 } }).sort({ date: -1 }).limit(500).toArray(),
       db.collection('demandes_collecte').find({ status: { $in: ['pending', 'accepted'] } }).limit(200).toArray()
     ]);
     res.json({ 
@@ -1076,7 +1076,7 @@ app.get('/api/restaurants', async (req, res) => {
     }
     
     const restaurants = await db.collection(COLLECTIONS.RESTAURANTS)
-      .find(query, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } })
+      .find(query, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } })
       .toArray();
     
     res.set('X-Total-Count', restaurants.length);
@@ -1252,7 +1252,7 @@ app.post('/api/collections', async (req, res) => {
     try {
       restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
         { $or: [{ id: data.restaurantId }, { qrCode: data.restaurantId }] },
-        { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0 } }
+        { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }
       );
     } catch(e) {}
     
