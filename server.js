@@ -609,7 +609,7 @@ async function getOperatorByEmail(email) { if (!db || !isConnected) return null;
 async function addOperator(operator) { if (!db || !isConnected) return null; try { const s = sanitizeObject(operator); return (await db.collection(COLLECTIONS.OPERATORS).insertOne({ ...s, _id: s.email, loginAttempts: 0, lockUntil: null, createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addOperator:', e.message); return null; } }
 async function updateOperator(email, data) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.OPERATORS).updateOne({ email: sanitizeInput(email) }, { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }); return true; } catch (e) { return false; } }
 async function deleteOperator(email) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.OPERATORS).deleteOne({ email: sanitizeInput(email) }); return true; } catch (e) { return false; } }
-async function getRestaurants(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.RESTAURANTS).find(q).toArray(); } catch (e) { return []; } }
+async function getRestaurants(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.RESTAURANTS).find(q, { projection: { contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).toArray(); } catch (e) { return []; } }
 async function getRestaurantById(id) { if (!db || !isConnected) return null; try { const s = sanitizeInput(id); return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ $or: [{ id: s }, { siret: s }, { qrCode: s }] }); } catch (e) { return null; } }
 async function getRestaurantByQRCode(qrCode) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ qrCode: sanitizeInput(qrCode) }); } catch (e) { return null; } }
 async function getRestaurantByEmail(email) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ email: sanitizeInput(email) }); } catch (e) { return null; } }
@@ -782,14 +782,14 @@ app.get('/api/bulk-data', async (req, res) => {
     if (!db || !isConnected) return res.json({ success: false, error: 'DB not connected' });
     const limit = parseInt(req.query.limit) || 500;
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, pendingOperators, approvedOperators, expeditions, avisClients, adminSettings] = await Promise.all([
-      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'deleted' } }).limit(limit).toArray().catch(() => []),
-      db.collection(COLLECTIONS.PENDING_RESTAURANTS).find({}).limit(limit).toArray().catch(() => []),
-      db.collection(COLLECTIONS.COLLECTIONS).find({}).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'deleted' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.PENDING_RESTAURANTS).find({}, { projection: { password: 0 } }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
       db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.PENDING_OPERATORS || 'pending_operators').find({}).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.APPROVED_OPERATORS || 'approved_operators').find({}).limit(100).toArray().catch(() => []),
-      db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.EXPEDITIONS).find({}, { projection: { bsdPdfBase64: 0, 'bsdCerfa.base64': 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
       db.collection('avis_clients').find({}).sort({ date: -1 }).limit(100).toArray().catch(() => []),
       db.collection('admin_settings').findOne({ id: 'main' }).catch(() => null)
     ]);
@@ -820,8 +820,8 @@ app.get('/api/bulk-load', async (req, res) => {
     if (!db || !isConnected) return res.json({ success: false, reason: 'db_not_ready' });
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, 
            pendingOperators, approvedOperators, expeditions, demandesCollecte] = await Promise.all([
-      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }).limit(500).toArray(),
-      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }).limit(100).toArray(),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(500).toArray(),
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(100).toArray(),
       db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0 } }).sort({ date: -1 }).limit(2000).toArray(),
       db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray(),
       db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray(),
@@ -1076,7 +1076,7 @@ app.get('/api/restaurants', async (req, res) => {
     }
     
     const restaurants = await db.collection(COLLECTIONS.RESTAURANTS)
-      .find(query, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } })
+      .find(query, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } })
       .toArray();
     
     res.set('X-Total-Count', restaurants.length);
@@ -1094,6 +1094,19 @@ app.post('/api/restaurants/:id/reject', async (req, res) => { await deleteRestau
 app.post('/api/restaurants', async (req, res) => { try { const { id, qrCode, ...data } = sanitizeObject(req.body); const rid = id || qrCode || uuidv4(); const existing = await getRestaurantById(rid); if (existing) return res.status(409).json({ success: false, error: 'QR Code deja attribue' }); await addRestaurant({ ...data, id: rid, qrCode: qrCode || rid, status: data.status || 'approved', dateCreated: new Date().toISOString() }); res.status(201).json({ success: true, id: rid, qrCode: qrCode || rid }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, sanitizeObject(req.body)); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.get('/api/restaurants/:id/contrat', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' });
+    const s = sanitizeInput(req.params.id);
+    const r = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
+      { $or: [{ id: s }, { qrCode: s }] },
+      { projection: { 'contrat.base64': 1, 'contrat.filename': 1, contratStatus: 1 } }
+    );
+    if (!r) return res.status(404).json({ error: 'Restaurant non trouvé' });
+    if (!r.contrat?.base64) return res.status(404).json({ error: 'Pas de contrat disponible' });
+    res.json({ success: true, base64: r.contrat.base64, filename: r.contrat.filename, contratStatus: r.contratStatus });
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
 app.post('/api/restaurants/:id/change-password', async (req, res) => {
   try {
     const { oldPassword, newPassword } = sanitizeObject(req.body);
@@ -1120,7 +1133,7 @@ app.get('/api/collections', async (req, res) => {
     const skip = (page - 1) * limit;
     const since = req.query.since || req.headers['if-modified-since'];
     
-    const projection = { colSignature: 0, restoSignature: 0 };
+    const projection = { colSignature: 0, restoSignature: 0, bsdPdfBase64: 0, signatureData: 0 };
     let query = {};
     
     // [FIX 3.3] Si le client envoie ?since=ISO_DATE, ne renvoyer que les collectes modifiées depuis
@@ -1252,7 +1265,7 @@ app.post('/api/collections', async (req, res) => {
     try {
       restaurant = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
         { $or: [{ id: data.restaurantId }, { qrCode: data.restaurantId }] },
-        { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0 } }
+        { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }
       );
     } catch(e) {}
     
@@ -1444,7 +1457,7 @@ app.post('/api/daily-volumes', async (req, res) => {
 app.get('/api/expeditions', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    const expeditions = await db.collection(COLLECTIONS.EXPEDITIONS).find({}).sort({ date: -1 }).limit(500).toArray();
+    const expeditions = await db.collection(COLLECTIONS.EXPEDITIONS).find({}, { projection: { bsdPdfBase64: 0, 'bsdCerfa.base64': 0 } }).sort({ date: -1 }).limit(500).toArray();
     res.json(expeditions || []);
   } catch (e) { res.json([]); }
 });
