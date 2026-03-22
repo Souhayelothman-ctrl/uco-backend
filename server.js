@@ -186,8 +186,11 @@ app.use(compression({
 }));
 const allowedOrigins = [
   'https://uco-and-co.netlify.app',
+  'https://comfy-brigadeiros-b8cc7f.netlify.app',
   'https://uco-and-co.fr',
   'https://www.uco-and-co.fr',
+  'https://uco-and-co.site',
+  'https://www.uco-and-co.site',
   process.env.FRONTEND_URL,
   'http://localhost:3000',
   'http://localhost:5173'
