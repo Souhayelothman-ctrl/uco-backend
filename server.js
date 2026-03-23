@@ -1019,6 +1019,7 @@ app.get('/api/collectors/approved', async (req, res) => { const c = await getCol
 app.post('/api/collectors/:email/approve', async (req, res) => { try { const { email } = req.params; const n = await generateCollectorNumber(); await updateCollector(email, { status: 'approved', collectorNumber: n, dateApproval: new Date().toISOString() }); await auditLog('COLLECTOR_APPROVED', email, { collectorNumber: n }, req); res.json({ success: true, collectorNumber: n }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.post('/api/collectors/:email/reject', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
 app.delete('/api/collectors/:email', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
+app.put('/api/collectors/:email/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); await updateCollector(req.params.email, { password: await bcrypt.hash(password, BCRYPT_ROUNDS), loginAttempts: 0, lockUntil: null }); await auditLog('COLLECTOR_PASSWORD_RESET', req.params.email, {}, req); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 // ===== OPERATEURS CRUD =====
 app.post('/api/operators/register', async (req, res) => {
   try {
@@ -1035,6 +1036,7 @@ app.get('/api/operators/approved', async (req, res) => { const o = await getOper
 app.post('/api/operators/:email/approve', async (req, res) => { const { email } = req.params; const n = await generateOperatorNumber(); await updateOperator(email, { status: 'approved', operatorNumber: n, dateApproval: new Date().toISOString() }); res.json({ success: true, operatorNumber: n }); });
 app.post('/api/operators/:email/reject', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
 app.delete('/api/operators/:email', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
+app.put('/api/operators/:email/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); await updateOperator(req.params.email, { password: await bcrypt.hash(password, BCRYPT_ROUNDS), loginAttempts: 0, lockUntil: null }); await auditLog('OPERATOR_PASSWORD_RESET', req.params.email, {}, req); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 // ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
@@ -1588,6 +1590,20 @@ function createRoleRoutes(app, roleName, collectionName, numberField, numberPref
       delete data._id; delete data.password;
       data.updatedAt = new Date().toISOString();
       await db.collection(collectionName).updateOne({ email: req.params.email }, { $set: data });
+      res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+
+  // Password reset (by admin)
+  app.put('/api/' + roleName + '/:email/password', async (req, res) => {
+    try {
+      const { password } = sanitizeObject(req.body);
+      if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe invalide' });
+      await db.collection(collectionName).updateOne(
+        { email: req.params.email },
+        { $set: { password: await bcrypt.hash(password, BCRYPT_ROUNDS), loginAttempts: 0, lockUntil: null, updatedAt: new Date().toISOString() } }
+      );
+      await auditLog(roleName.toUpperCase() + '_PASSWORD_RESET', req.params.email, {}, req);
       res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
   });
