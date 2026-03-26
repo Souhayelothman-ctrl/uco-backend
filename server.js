@@ -193,7 +193,10 @@ const allowedOrigins = [
   'https://www.uco-and-co.site',
   process.env.FRONTEND_URL,
   'http://localhost:3000',
-  'http://localhost:5173'
+  'http://localhost:5173',
+  'https://localhost',
+  'capacitor://localhost',
+  'http://localhost'
 ].filter(Boolean);
 if (process.env.CORS_ORIGIN) {
   process.env.CORS_ORIGIN.split(',').forEach(origin => {
