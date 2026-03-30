@@ -1102,6 +1102,32 @@ app.post('/api/restaurants/:id/reject', async (req, res) => { await deleteRestau
 app.post('/api/restaurants', async (req, res) => { try { const { id, qrCode, ...data } = sanitizeObject(req.body); const rid = id || qrCode || uuidv4(); const existing = await getRestaurantById(rid); if (existing) return res.status(409).json({ success: false, error: 'QR Code deja attribue' }); await addRestaurant({ ...data, id: rid, qrCode: qrCode || rid, status: data.status || 'approved', dateCreated: new Date().toISOString() }); res.status(201).json({ success: true, id: rid, qrCode: qrCode || rid }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, sanitizeObject(req.body)); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+// =============================================
+// [SESSION 15] PATCH server.js — endpoint /api/restaurants/:id/full
+// =============================================
+// INSTRUCTION : Dans server.js, trouver la ligne :
+//   app.get('/api/restaurants/:id/contrat', async (req, res) => {
+// Et INSÉRER CE BLOC JUSTE AVANT :
+
+app.get('/api/restaurants/:id/full', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' });
+    const s = sanitizeInput(req.params.id);
+    const r = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
+      { $or: [{ id: s }, { qrCode: s }, { email: s }] }
+      // Pas de projection — retourne TOUT incluant les signatures
+    );
+    if (!r) return res.status(404).json({ error: 'Restaurant non trouvé' });
+    // Retirer uniquement les données d'authentification
+    const { password, tempPassword, loginAttempts, lockUntil, ...data } = r;
+    res.json({ success: true, restaurant: data });
+  } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
+});
+
+// =============================================
+// FIN DU PATCH — ensuite vient l'existant :
+// app.get('/api/restaurants/:id/contrat', async (req, res) => { ...
+// =============================================
 app.get('/api/restaurants/:id/contrat', async (req, res) => {
   try {
     if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' });
