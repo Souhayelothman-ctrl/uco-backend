@@ -1023,6 +1023,16 @@ app.post('/api/collectors/:email/approve', async (req, res) => { try { const { e
 app.post('/api/collectors/:email/reject', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
 app.delete('/api/collectors/:email', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
 app.put('/api/collectors/:email/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); await updateCollector(req.params.email, { password: await bcrypt.hash(password, BCRYPT_ROUNDS), loginAttempts: 0, lockUntil: null }); await auditLog('COLLECTOR_PASSWORD_RESET', req.params.email, {}, req); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/collectors/:email/unlock', async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const user = await getCollectorByEmail(email);
+    if (!user) return res.status(404).json({ success: false, error: 'Compte non trouvé' });
+    await updateCollector(email, { loginAttempts: 0, lockUntil: null });
+    await auditLog('COLLECTOR_UNLOCKED', email, { unlockedBy: 'admin' }, req);
+    res.json({ success: true, message: 'Compte déverrouillé' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
 // ===== OPERATEURS CRUD =====
 app.post('/api/operators/register', async (req, res) => {
   try {
@@ -1040,6 +1050,16 @@ app.post('/api/operators/:email/approve', async (req, res) => { const { email } 
 app.post('/api/operators/:email/reject', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
 app.delete('/api/operators/:email', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
 app.put('/api/operators/:email/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); await updateOperator(req.params.email, { password: await bcrypt.hash(password, BCRYPT_ROUNDS), loginAttempts: 0, lockUntil: null }); await auditLog('OPERATOR_PASSWORD_RESET', req.params.email, {}, req); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/operators/:email/unlock', async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const user = await getOperatorByEmail(email);
+    if (!user) return res.status(404).json({ success: false, error: 'Compte non trouvé' });
+    await updateOperator(email, { loginAttempts: 0, lockUntil: null });
+    await auditLog('OPERATOR_UNLOCKED', email, { unlockedBy: 'admin' }, req);
+    res.json({ success: true, message: 'Compte déverrouillé' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
 // ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
@@ -1102,6 +1122,16 @@ app.post('/api/restaurants/:id/reject', async (req, res) => { await deleteRestau
 app.post('/api/restaurants', async (req, res) => { try { const { id, qrCode, ...data } = sanitizeObject(req.body); const rid = id || qrCode || uuidv4(); const existing = await getRestaurantById(rid); if (existing) return res.status(409).json({ success: false, error: 'QR Code deja attribue' }); await addRestaurant({ ...data, id: rid, qrCode: qrCode || rid, status: data.status || 'approved', dateCreated: new Date().toISOString() }); res.status(201).json({ success: true, id: rid, qrCode: qrCode || rid }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, sanitizeObject(req.body)); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.put('/api/restaurants/:id/password', async (req, res) => { try { const { password } = sanitizeObject(req.body); if (!password || password.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe invalide' }); const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); await updateRestaurant(req.params.id, { password: await bcrypt.hash(password, BCRYPT_ROUNDS) }); res.json({ success: true }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
+app.post('/api/restaurants/:id/unlock', async (req, res) => {
+  try {
+    const id = decodeURIComponent(req.params.id);
+    const r = await getRestaurantById(id) || await getRestaurantByEmail(id);
+    if (!r) return res.status(404).json({ success: false, error: 'Compte non trouvé' });
+    await updateRestaurant(r.id, { loginAttempts: 0, lockUntil: null });
+    await auditLog('RESTAURANT_UNLOCKED', id, { unlockedBy: 'admin' }, req);
+    res.json({ success: true, message: 'Compte déverrouillé' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
 // =============================================
 // [SESSION 15] PATCH server.js — endpoint /api/restaurants/:id/full
 // =============================================
@@ -1634,6 +1664,18 @@ function createRoleRoutes(app, roleName, collectionName, numberField, numberPref
       );
       await auditLog(roleName.toUpperCase() + '_PASSWORD_RESET', req.params.email, {}, req);
       res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  });
+  // Unlock (by admin)
+  app.post('/api/' + roleName + '/:email/unlock', async (req, res) => {
+    try {
+      const email = decodeURIComponent(req.params.email);
+      await db.collection(collectionName).updateOne(
+        { email },
+        { $set: { loginAttempts: 0, lockUntil: null, updatedAt: new Date().toISOString() } }
+      );
+      await auditLog(roleName.toUpperCase() + '_UNLOCKED', email, { unlockedBy: 'admin' }, req);
+      res.json({ success: true, message: 'Compte déverrouillé' });
     } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
   });
 }
