@@ -1018,7 +1018,7 @@ app.post('/api/collectors/register', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.get('/api/collectors/pending', async (req, res) => { const c = await getCollectors('pending'); res.json(c.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
-app.get('/api/collectors/approved', async (req, res) => { const c = await getCollectors('approved'); res.json(c.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.get('/api/collectors/approved', async (req, res) => { const c = await getCollectors('approved'); res.json(c.map(({ password, ...x }) => x)); });
 app.post('/api/collectors/:email/approve', async (req, res) => { try { const { email } = req.params; const n = await generateCollectorNumber(); await updateCollector(email, { status: 'approved', collectorNumber: n, dateApproval: new Date().toISOString() }); await auditLog('COLLECTOR_APPROVED', email, { collectorNumber: n }, req); res.json({ success: true, collectorNumber: n }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.post('/api/collectors/:email/reject', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
 app.delete('/api/collectors/:email', async (req, res) => { await deleteCollector(req.params.email); res.json({ success: true }); });
@@ -1045,7 +1045,7 @@ app.post('/api/operators/register', async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.get('/api/operators/pending', async (req, res) => { const o = await getOperators('pending'); res.json(o.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
-app.get('/api/operators/approved', async (req, res) => { const o = await getOperators('approved'); res.json(o.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.get('/api/operators/approved', async (req, res) => { const o = await getOperators('approved'); res.json(o.map(({ password, ...x }) => x)); });
 app.post('/api/operators/:email/approve', async (req, res) => { const { email } = req.params; const n = await generateOperatorNumber(); await updateOperator(email, { status: 'approved', operatorNumber: n, dateApproval: new Date().toISOString() }); res.json({ success: true, operatorNumber: n }); });
 app.post('/api/operators/:email/reject', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
 app.delete('/api/operators/:email', async (req, res) => { await deleteOperator(req.params.email); res.json({ success: true }); });
@@ -1604,7 +1604,7 @@ function createRoleRoutes(app, roleName, collectionName, numberField, numberPref
     try {
       if (!db || !isConnected) return res.json([]);
       const items = await db.collection(collectionName).find({ status: 'approved' }).toArray();
-      res.json(items.map(({ password, loginAttempts, lockUntil, ...x }) => x));
+      res.json(items.map(({ password, ...x }) => x));
     } catch (e) { res.json([]); }
   });
 
