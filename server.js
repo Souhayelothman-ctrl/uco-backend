@@ -1091,7 +1091,7 @@ app.get('/api/restaurants/pending', async (req, res) => { const r = await getRes
 app.get('/api/restaurants', async (req, res) => {
   try {
     if (!db || !isConnected) return res.json([]);
-    const since = req.query.since || req.headers['if-modified-since'];
+    const since = req.query.since;
     let query = { status: { $in: ['approved', 'terminated'] } };
     
     if (since) {
