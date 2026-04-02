@@ -1195,7 +1195,7 @@ app.get('/api/collections', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit) || 2000));
     const skip = (page - 1) * limit;
-    const since = req.query.since || req.headers['if-modified-since'];
+    const since = req.query.since;
     
     const projection = { colSignature: 0, restoSignature: 0, bsdPdfBase64: 0, signatureData: 0 };
     let query = {};
