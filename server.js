@@ -2089,17 +2089,7 @@ app.use((err, req, res, next) => {
   if (err.message === 'Non autorise par CORS') return res.status(403).json({ success: false, error: 'Acces non autorise' });
   res.status(500).json({ success: false, error: 'Erreur serveur interne' });
 });
-app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
 
-// [FIX OOM] Nettoyage periodique des tournees abandonnees (>48h)
-setInterval(async () => {
-  if (!db || !isConnected) return;
-  try {
-    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteMany({ lastUpdate: { $lt: cutoff } });
-    if (result.deletedCount > 0) console.log('Nettoyage: ' + result.deletedCount + ' tournee(s) abandonnee(s) supprimee(s)');
-  } catch (e) { console.log('Erreur nettoyage:', e.message); }
-}, 6 * 60 * 60 * 1000);
 // =============================================================
 // OUTIL DE DIAGNOSTIC COMPTE — UCO AND CO
 // GET /api/admin/diagnose?q=<email | siret | nom>
@@ -2263,6 +2253,17 @@ app.get('/api/admin/diagnose', authenticateToken, requireRole('admin'), async (r
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
+app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
+
+// [FIX OOM] Nettoyage periodique des tournees abandonnees (>48h)
+setInterval(async () => {
+  if (!db || !isConnected) return;
+  try {
+    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const result = await db.collection(COLLECTIONS.TOURNEES_EN_COURS).deleteMany({ lastUpdate: { $lt: cutoff } });
+    if (result.deletedCount > 0) console.log('Nettoyage: ' + result.deletedCount + ' tournee(s) abandonnee(s) supprimee(s)');
+  } catch (e) { console.log('Erreur nettoyage:', e.message); }
+}, 6 * 60 * 60 * 1000);
 
 // =============================================
 // DEMARRAGE DU SERVEUR
