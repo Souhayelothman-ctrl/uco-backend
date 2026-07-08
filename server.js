@@ -2100,6 +2100,169 @@ setInterval(async () => {
     if (result.deletedCount > 0) console.log('Nettoyage: ' + result.deletedCount + ' tournee(s) abandonnee(s) supprimee(s)');
   } catch (e) { console.log('Erreur nettoyage:', e.message); }
 }, 6 * 60 * 60 * 1000);
+// =============================================================
+// OUTIL DE DIAGNOSTIC COMPTE — UCO AND CO
+// GET /api/admin/diagnose?q=<email | siret | nom>
+// Cherche dans les 7 collections de profils et renvoie un verdict
+// clair : le compte peut-il se connecter, et si non, pourquoi.
+//
+// À COLLER dans server.js JUSTE AVANT la ligne `app.listen(PORT, ...`
+// (tous les helpers utilisés — db, COLLECTIONS, authenticateToken,
+//  requireRole, isAccountLocked, sanitizeInput — sont déjà définis
+//  plus haut dans le fichier).
+// =============================================================
+app.get('/api/admin/diagnose', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+
+    const raw = sanitizeInput(req.query.q || '');
+    if (!raw || raw.length < 2) {
+      return res.status(400).json({ success: false, error: 'Paramètre q requis (email, SIRET ou nom)' });
+    }
+
+    // On teste 3 formes : email, SIRET (chiffres uniquement), et nom (regex insensible à la casse)
+    const asSiret = raw.replace(/\D/g, '');
+    const nameRegex = { $regex: raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+
+    // Les 7 collections de profils qui possèdent un login
+    const profiles = [
+      { role: 'restaurant',    coll: COLLECTIONS.RESTAURANTS },
+      { role: 'collecteur',    coll: COLLECTIONS.COLLECTORS },
+      { role: 'operateur',     coll: COLLECTIONS.OPERATORS },
+      { role: 'transporteur',  coll: COLLECTIONS.TRANSPORTEURS },
+      { role: 'recepteur',     coll: COLLECTIONS.RECEPTEURS },
+      { role: 'certificateur', coll: COLLECTIONS.CERTIFICATEURS }
+    ];
+
+    const matches = [];
+
+    for (const p of profiles) {
+      const or = [
+        { email: nameRegex },
+        { enseigne: nameRegex },
+        { societe: nameRegex },
+        { nom: nameRegex },
+        { name: nameRegex },
+        { entreprise: nameRegex }
+      ];
+      if (asSiret.length === 14) or.push({ siret: asSiret });
+
+      let docs = [];
+      try {
+        docs = await db.collection(p.coll).find({ $or: or }).limit(5).toArray();
+      } catch (e) { /* collection absente ou erreur — on ignore */ }
+
+      for (const d of docs) {
+        // --- Lecture des champs, tolérante aux variations de nommage ---
+        const displayName = d.enseigne || d.societe || d.nom || d.name || d.entreprise || d.email || d.id || '(sans nom)';
+        const hasPassword = !!d.password;
+        const passwordHashed = hasPassword && /^\$2[aby]\$/.test(d.password);
+        // temp password : le code officiel utilise `tempPassword`, mais la base
+        // contient parfois `_tempPassword` (ancien flux). On regarde les deux.
+        const tempValue = d.tempPassword || d._tempPassword || null;
+        const hasTemp = !!tempValue;
+        const emailVerified = ('emailVerified' in d) ? d.emailVerified
+                            : ('verified' in d) ? d.verified
+                            : null; // null = champ absent
+        const locked = isAccountLocked(d);
+        const status = d.status || '(aucun)';
+
+        // --- Reproduction de la logique de login pour un verdict fidèle ---
+        const blockers = [];
+        // status
+        const statusOk = status === 'approved'
+          || (hasTemp && !d.status)
+          || (d.createdBy === 'admin' && !d.status);
+        if (!statusOk) {
+          if (status === 'pending') blockers.push('Compte en attente d\'approbation (status=pending)');
+          else if (status === 'terminated') blockers.push('Contrat résilié (status=terminated)');
+          else blockers.push('Compte non approuvé (status=' + status + ')');
+        }
+        // mot de passe
+        if (!hasPassword && !hasTemp) blockers.push('AUCUN mot de passe en base — reset requis');
+        // verrouillage
+        if (locked) blockers.push('Compte verrouillé jusqu\'à ' + d.lockUntil);
+        // email vérifié (uniquement si le champ existe ET est false)
+        if (emailVerified === false) blockers.push('Email non vérifié (emailVerified=false)');
+
+        const canLoginNow = blockers.length === 0;
+
+        // --- Alertes / conseils ---
+        const notes = [];
+        if (hasTemp) {
+          notes.push('⚠️ RESET DÉTECTÉ : l\'ancien mot de passe ne fonctionne plus. Le compte attend le mot de passe temporaire ci-dessous.');
+        }
+        if (hasPassword && !passwordHashed) {
+          notes.push('🔴 Sécurité : le mot de passe n\'est PAS hashé (devrait commencer par $2).');
+        }
+        if ('confirmPassword' in d) {
+          notes.push('🔴 Sécurité : le champ confirmPassword est stocké en clair et devrait être purgé.');
+        }
+        if (d._tempPassword && !d.tempPassword) {
+          notes.push('ℹ️ Le temporaire est stocké sous _tempPassword (ancien flux) — non nettoyé par le changement de mot de passe.');
+        }
+
+        // --- Action recommandée ---
+        let action;
+        if (canLoginNow && hasTemp) {
+          action = 'Communiquer le mot de passe temporaire au compte : « ' + tempValue + ' » (à taper exactement).';
+        } else if (canLoginNow) {
+          action = 'Aucun blocage en base. Si la connexion échoue quand même, vérifier le mot de passe saisi, ou regarder les logs Render.';
+        } else if (blockers.some(b => b.startsWith('AUCUN mot de passe'))) {
+          action = 'Régénérer un mot de passe via le bouton 🔐 Superviseur (ou PUT /api/' + p.coll + '/:id/password).';
+        } else if (blockers.some(b => b.includes('non approuvé') || b.includes('attente'))) {
+          action = 'Passer status à "approved" (Superviseur ou Data Explorer).';
+        } else if (locked) {
+          action = 'Déverrouiller le compte (POST /api/restaurants/:id/unlock ou remettre loginAttempts=0, lockUntil=null).';
+        } else if (emailVerified === false) {
+          action = 'Forcer emailVerified=true, ou demander au compte de cliquer le lien reçu par email.';
+        } else {
+          action = 'Voir les blocages listés.';
+        }
+
+        matches.push({
+          role: p.role,
+          collection: p.coll,
+          id: d.id || d._id || null,
+          displayName,
+          email: d.email || null,
+          siret: d.siret || null,
+          status,
+          canLoginNow,
+          blockers,
+          tempPasswordActif: hasTemp ? tempValue : null,
+          diagnostic: {
+            hasPassword,
+            passwordHashed,
+            emailVerified,        // true / false / null(champ absent)
+            locked,
+            lockUntil: d.lockUntil || null,
+            loginAttempts: d.loginAttempts || 0
+          },
+          notes,
+          action
+        });
+      }
+    }
+
+    // Journalise la consultation (traçabilité admin)
+    await auditLog('ADMIN_DIAGNOSE', req.user.email, { q: raw, found: matches.length }, req);
+
+    if (matches.length === 0) {
+      return res.json({
+        success: true,
+        query: raw,
+        found: 0,
+        message: 'Aucun compte trouvé dans les 6 profils pour « ' + raw + ' ». Vérifiez l\'orthographe ou essayez le SIRET / l\'email exact.'
+      });
+    }
+
+    res.json({ success: true, query: raw, found: matches.length, matches });
+  } catch (e) {
+    console.error('Erreur /api/admin/diagnose:', e.message);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
 
 // =============================================
 // DEMARRAGE DU SERVEUR
