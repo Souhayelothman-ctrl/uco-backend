@@ -962,16 +962,20 @@ app.post('/api/auth/restaurant', async (req, res) => {
     const { email, password } = sanitizeObject(req.body);
     if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
     const restaurant = await getRestaurantByEmail(email);
-    if (!restaurant) return res.status(401).json({ success: false, error: 'Compte non trouve' });
-    if (restaurant.status === 'pending') return res.json({ success: false, error: 'pending' });
-    if (restaurant.status === 'terminated') return res.status(401).json({ success: false, error: 'Contrat resilie' });
+    if (!restaurant) { await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'email_introuvable' }, req); return res.status(401).json({ success: false, error: 'Compte non trouve' }); }
+    if (restaurant.status === 'pending') { await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'compte_en_attente' }, req); return res.json({ success: false, error: 'pending' }); }
+    if (restaurant.status === 'terminated') { await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'contrat_resilie' }, req); return res.status(401).json({ success: false, error: 'Contrat resilie' }); }
     const isApproved = restaurant.status === 'approved' || (restaurant.tempPassword && !restaurant.status) || (restaurant.createdBy === 'admin' && !restaurant.status);
-    if (!isApproved) return res.status(401).json({ success: false, error: 'Compte non approuve' });
-    if (isAccountLocked(restaurant)) return res.status(423).json({ success: false, error: 'Compte verrouille' });
+    if (!isApproved) { await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'non_approuve', status: restaurant.status || null }, req); return res.status(401).json({ success: false, error: 'Compte non approuve' }); }
+    if (isAccountLocked(restaurant)) { await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'compte_verrouille', lockUntil: restaurant.lockUntil }, req); return res.status(423).json({ success: false, error: 'Compte verrouille' }); }
     let isValid = false; let usedTempPassword = false;
     if (restaurant.password) { try { isValid = await bcrypt.compare(password, restaurant.password); } catch (e) {} }
     if (!isValid && restaurant.tempPassword) { isValid = (password === restaurant.tempPassword); usedTempPassword = isValid; }
-    if (!isValid) { await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email); return res.status(401).json({ success: false, error: 'Mot de passe incorrect' }); }
+    if (!isValid) {
+      await incrementLoginAttempts(COLLECTIONS.RESTAURANTS, email);
+      await auditLog('RESTAURANT_LOGIN_FAILED', email, { reason: 'mot_de_passe_incorrect', tempPasswordActif: !!(restaurant.tempPassword || restaurant._tempPassword), loginAttempts: (restaurant.loginAttempts || 0) + 1 }, req);
+      return res.status(401).json({ success: false, error: 'Mot de passe incorrect' });
+    }
     if (!restaurant.status && (restaurant.tempPassword || restaurant.createdBy === 'admin')) await updateRestaurant(restaurant.id, { status: 'approved' });
     await resetLoginAttempts(COLLECTIONS.RESTAURANTS, email);
     const token = generateToken({ role: 'restaurant', email, id: restaurant.id });
@@ -1063,7 +1067,7 @@ app.post('/api/operators/:email/unlock', async (req, res) => {
 // ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
-    const { email, password, id, qrCode, siret, ...data } = sanitizeObject(req.body);
+    const { email, password, confirmPassword, id, qrCode, siret, ...data } = sanitizeObject(req.body);
     let existingBySiret = null;
     if (siret && db && isConnected) existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
     if (existingBySiret) {
@@ -1182,7 +1186,7 @@ app.post('/api/restaurants/:id/change-password', async (req, res) => {
     if (r.password) isOldValid = await bcrypt.compare(oldPassword, r.password);
     if (!isOldValid && r.tempPassword) isOldValid = (oldPassword === r.tempPassword);
     if (!isOldValid) return res.status(401).json({ success: false, error: 'Ancien mot de passe incorrect' });
-    await updateRestaurant(req.params.id, { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), tempPassword: null, passwordChangedAt: new Date().toISOString() });
+    await updateRestaurant(req.params.id, { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), tempPassword: null, _tempPassword: null, passwordChangedAt: new Date().toISOString() });
     res.json({ success: true, message: 'Mot de passe modifie avec succes' });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
@@ -2252,6 +2256,34 @@ app.get('/api/admin/diagnose', authenticateToken, requireRole('admin'), async (r
     console.error('Erreur /api/admin/diagnose:', e.message);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
+});
+// =============================================================
+// NETTOYAGE SÉCURITÉ — purge des champs sensibles stockés en clair
+// POST /api/admin/cleanup-security
+// Supprime confirmPassword et _tempPassword de toutes les fiches
+// des 6 collections de profils. À exécuter une fois (ré-exécutable
+// sans danger : ne touche que les fiches qui ont encore ces champs).
+// NOTE : ne casse aucun login — le mot de passe hashé (champ
+// password) n'est pas modifié.
+// Doit rester AVANT le handler 404 ("Route non trouvee").
+// =============================================================
+app.post('/api/admin/cleanup-security', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+    const colls = [COLLECTIONS.RESTAURANTS, COLLECTIONS.COLLECTORS, COLLECTIONS.OPERATORS, COLLECTIONS.TRANSPORTEURS, COLLECTIONS.RECEPTEURS, COLLECTIONS.CERTIFICATEURS];
+    const report = {};
+    for (const c of colls) {
+      try {
+        const r = await db.collection(c).updateMany(
+          { $or: [{ confirmPassword: { $exists: true } }, { _tempPassword: { $exists: true } }] },
+          { $unset: { confirmPassword: '', _tempPassword: '' } }
+        );
+        report[c] = r.modifiedCount;
+      } catch (e) { report[c] = 'erreur: ' + e.message; }
+    }
+    await auditLog('SECURITY_CLEANUP', req.user.email, report, req);
+    res.json({ success: true, cleaned: report, message: 'Champs confirmPassword et _tempPassword purges' });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
 
