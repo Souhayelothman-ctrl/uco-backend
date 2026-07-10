@@ -275,6 +275,34 @@ app.use((req, res, next) => {
   next();
 });
 // =============================================
+// [SÉCU API] GARDE GLOBALE — Authentification par défaut
+// Toute route /api/* exige un token JWT valide, SAUF la liste blanche
+// ci-dessous (connexion, inscriptions, récupération de mot de passe,
+// proxys publics, webhook Stripe). La base clients n'est ainsi JAMAIS
+// accessible sans être connecté à l'application.
+// NOTE : authenticateToken est une déclaration de fonction (hoistée),
+// utilisable ici bien que définie plus bas dans le fichier.
+// =============================================
+const PUBLIC_API_RULES = [
+  { m: 'GET',  t: (p) => p === '/api/health' },
+  { m: '*',    t: (p) => p.startsWith('/api/auth/') },
+  { m: 'POST', t: (p) => /^\/api\/(collectors|operators|restaurants|transporteurs|recepteurs|certificateurs)\/register$/.test(p) },
+  { m: 'POST', t: (p) => p.startsWith('/api/password-reset/') },
+  { m: '*',    t: (p) => p.startsWith('/api/proxy/') },
+  { m: 'GET',  t: (p) => p.startsWith('/api/restaurants/siret/') },
+  { m: 'POST', t: (p) => p === '/api/stripe/webhook' },
+  { m: 'POST', t: (p) => p === '/api/errors' },
+  { m: 'GET',  t: (p) => p === '/api/settings' },
+  { m: 'GET',  t: (p) => p === '/api/services-disponibles' },
+  { m: 'POST', t: (p) => p === '/api/demandes-collecte' }
+];
+app.use('/api', (req, res, next) => {
+  const path = (req.baseUrl + req.path).split('?')[0].replace(/\/+$/, '') || req.baseUrl;
+  const isPublic = PUBLIC_API_RULES.some(r => (r.m === '*' || r.m === req.method) && r.t(path));
+  if (isPublic) return next();
+  return authenticateToken(req, res, next);
+});
+// =============================================
 // CONFIGURATION MONGODB ATLAS
 // =============================================
 const MONGODB_URI = process.env.MONGODB_URI || '';
@@ -1119,7 +1147,9 @@ app.get('/api/restaurants', async (req, res) => {
   } catch (e) { res.json([]); }
 });
 app.get('/api/restaurants/qr/:qrCode', async (req, res) => { const r = await getRestaurantByQRCode(req.params.qrCode); if (!r || r.status !== 'approved') return res.status(404).json({ error: 'Restaurant non trouve' }); const { password, loginAttempts, lockUntil, ...data } = r; res.json(data); });
-app.get('/api/restaurants/siret/:siret', async (req, res) => { const siret = req.params.siret.replace(/\D/g, ''); if (siret.length !== 14) return res.status(400).json({ error: 'SIRET invalide' }); if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' }); const r = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret }); if (!r) return res.status(404).json({ error: 'Restaurant non trouve', exists: false }); const { password, loginAttempts, lockUntil, ...data } = r; res.json({ ...data, exists: true }); });
+// [SÉCU API] Route publique (vérif SIRET à l'inscription) — réponse MINIMALE :
+// uniquement l'existence et le statut, AUCUNE donnée client (adresse, tel, email, GPS...).
+app.get('/api/restaurants/siret/:siret', async (req, res) => { const siret = req.params.siret.replace(/\D/g, ''); if (siret.length !== 14) return res.status(400).json({ error: 'SIRET invalide' }); if (!db || !isConnected) return res.status(503).json({ error: 'DB non disponible' }); const r = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret }); if (!r) return res.status(404).json({ error: 'Restaurant non trouve', exists: false }); res.json({ exists: true, status: r.status || null, contratStatus: r.contratStatus || null, enseigne: r.enseigne || null, hasPassword: !!r.password, id: r.id || null }); });
 app.post('/api/restaurants/:id/terminate', async (req, res) => { try { const r = await getRestaurantById(req.params.id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); const dt = new Date().toISOString(); await updateRestaurant(req.params.id, { status: 'terminated', dateTerminated: dt, terminationReason: req.body?.reason || 'Fin de contrat' }); res.json({ success: true, dateTerminated: dt }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.post('/api/restaurants/:id/approve', async (req, res) => { try { const { id } = req.params; const { qrCode, password, ...upd } = sanitizeObject(req.body); const r = await getRestaurantById(id); if (!r) return res.status(404).json({ success: false, error: 'Non trouve' }); const updates = { ...upd, status: 'approved', qrCode: qrCode || r.qrCode || 'UCO-' + Date.now(), dateApproval: new Date().toISOString() }; if (password && !r.password) updates.password = await bcrypt.hash(password, BCRYPT_ROUNDS); await updateRestaurant(id, updates); res.json({ success: true, qrCode: updates.qrCode }); } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); } });
 app.post('/api/restaurants/:id/reject', async (req, res) => { await deleteRestaurant(req.params.id); res.json({ success: true }); });
