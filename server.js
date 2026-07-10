@@ -1390,13 +1390,24 @@ app.put('/api/admin/password', async (req, res) => {
     const { currentPassword, newPassword } = sanitizeObject(req.body);
     if (!currentPassword || !newPassword) return res.status(400).json({ success: false, error: 'Mots de passe requis' });
     if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
     const admin = await getAdmin();
     const isValid = await bcrypt.compare(currentPassword, admin.password);
-    if (!isValid) return res.status(401).json({ success: false, error: 'Mot de passe actuel incorrect' });
-    const settings = await getSettings();
-    await updateSettings({ ...settings, admin: { ...admin, password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) } });
+    if (!isValid) { await auditLog('ADMIN_PASSWORD_CHANGE_FAILED', admin.email, { reason: 'mot_de_passe_actuel_incorrect' }, req); return res.status(401).json({ success: false, error: 'Mot de passe actuel incorrect' }); }
+    // [FIX] Écriture directe en base : updateSettings() protège volontairement le champ
+    // admin contre l'écrasement, ce qui annulait silencieusement le changement de mot de passe.
+    const newHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    const existingDoc = await db.collection(COLLECTIONS.SETTINGS).findOne({});
+    const docId = existingDoc?._id || 'main';
+    await db.collection(COLLECTIONS.SETTINGS).updateOne(
+      { _id: docId },
+      { $set: { 'admin.password': newHash, 'admin.email': admin.email } },
+      { upsert: true }
+    );
+    cache.settings = null; cache.lastSettingsUpdate = 0;
+    await auditLog('ADMIN_PASSWORD_CHANGED', admin.email, {}, req);
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+  } catch (e) { console.error('Erreur admin/password:', e.message); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
 // ===== EMAIL =====
 app.post('/api/send-email', async (req, res) => {
