@@ -293,8 +293,7 @@ const PUBLIC_API_RULES = [
   { m: 'POST', t: (p) => p === '/api/stripe/webhook' },
   { m: 'POST', t: (p) => p === '/api/errors' },
   { m: 'GET',  t: (p) => p === '/api/settings' },
-  { m: 'GET',  t: (p) => p === '/api/services-disponibles' },
-  { m: 'POST', t: (p) => p === '/api/demandes-collecte' }
+  { m: 'GET',  t: (p) => p === '/api/services-disponibles' }
 ];
 app.use('/api', (req, res, next) => {
   const path = (req.baseUrl + req.path).split('?')[0].replace(/\/+$/, '') || req.baseUrl;
