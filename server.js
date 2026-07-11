@@ -2325,6 +2325,91 @@ app.post('/api/admin/cleanup-security', authenticateToken, requireRole('admin'),
     res.json({ success: true, cleaned: report, message: 'Champs confirmPassword et _tempPassword purges' });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
+// =============================================================
+// [IMPORT] Import en masse de restaurants (base SourcingContact)
+// POST /api/admin/import-restaurants   (réservé admin)
+// Body: { restaurants: [ {enseigne, siret, siren, adresse, ...}, ... ], dryRun?: bool }
+// - Upsert par SIRET puis par SIREN : ne crée JAMAIS de doublon avec un
+//   client existant ; enrichit la fiche sans toucher au mot de passe ni au
+//   contrat s'ils existent déjà.
+// - Les nouveaux : status 'approved', createdBy 'admin', sans mot de passe,
+//   contratStatus vide (signature à la première collecte terrain).
+// - dryRun: true => simule et renvoie le rapport sans rien écrire.
+// - Ré-exécutable sans danger (idempotent sur les champs d'identité).
+// Doit rester AVANT le handler 404 ("Route non trouvee").
+// =============================================================
+app.post('/api/admin/import-restaurants', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+    const body = sanitizeObject(req.body);
+    const items = Array.isArray(body.restaurants) ? body.restaurants : [];
+    const dryRun = !!body.dryRun;
+    if (items.length === 0) return res.status(400).json({ success: false, error: 'Aucun restaurant fourni' });
+    if (items.length > 2000) return res.status(400).json({ success: false, error: 'Lot trop volumineux (max 2000)' });
+
+    // Pré-charger l'existant (une seule lecture) pour dédup + numérotation QR
+    const all = await db.collection(COLLECTIONS.RESTAURANTS).find({}, { projection: { siret: 1, siren: 1, qrCode: 1, id: 1, password: 1, contratStatus: 1, status: 1, enseigne: 1 } }).toArray();
+    const bySiret = new Map(all.filter(r => r.siret).map(r => [String(r.siret), r]));
+    const bySiren = new Map(all.filter(r => r.siren).map(r => [String(r.siren), r]));
+    let maxQR = all.filter(r => r.qrCode && /^QR-\d+$/.test(r.qrCode)).map(r => parseInt(r.qrCode.slice(3)) || 0).reduce((a, b) => Math.max(a, b), 0);
+
+    const report = { total: items.length, crees: 0, enrichis: 0, ignores: 0, erreurs: 0, details: [] };
+
+    for (const it of items) {
+      try {
+        const siret = it.siret ? String(it.siret).replace(/\D/g, '') : '';
+        const siren = it.siren ? String(it.siren).replace(/\D/g, '').slice(0, 9) : (siret ? siret.slice(0, 9) : '');
+        if (!siren) { report.ignores++; report.details.push({ enseigne: it.enseigne || '?', action: 'ignore_sans_identifiant' }); continue; }
+
+        // Champs enrichissables (jamais password / contrat / status s'ils existent)
+        const champs = {};
+        for (const k of ['enseigne', 'adresse', 'codePostal', 'ville', 'gps', 'derniereCollecte', 'frequence', 'prixLitre', 'tel', 'email', 'gerant', 'consignes', 'siret', 'siren']) {
+          if (it[k] !== undefined && it[k] !== null && it[k] !== '') champs[k] = it[k];
+        }
+
+        const existing = (siret && bySiret.get(siret)) || bySiren.get(siren);
+        if (existing) {
+          // ENRICHISSEMENT : on ne remplit que les champs, on ne touche pas au reste
+          if (!dryRun) await updateRestaurant(existing.id, { ...champs, importedFrom: 'sourcing_2026-07', importUpdatedAt: new Date().toISOString() });
+          report.enrichis++;
+          report.details.push({ enseigne: it.enseigne, siret: siret || siren, action: 'enrichi', id: existing.id, qrCode: existing.qrCode });
+        } else {
+          // CRÉATION
+          maxQR += 1;
+          const qr = 'QR-' + String(maxQR).padStart(5, '0');
+          const doc = {
+            id: qr, qrCode: qr,
+            ...champs,
+            siret: siret || siren, siren,
+            email: it.email || '',
+            password: null,
+            status: 'approved',
+            createdBy: 'admin',
+            contratStatus: '',
+            typeProducteur: 'Restaurant',
+            importedFrom: 'sourcing_2026-07',
+            dateCreated: new Date().toISOString()
+          };
+          if (!dryRun) await addRestaurant(doc);
+          // maj des maps pour cohérence intra-lot
+          if (siret) bySiret.set(siret, { id: qr, qrCode: qr });
+          bySiren.set(siren, { id: qr, qrCode: qr });
+          report.crees++;
+          report.details.push({ enseigne: it.enseigne, siret: siret || siren, action: 'cree', id: qr, qrCode: qr });
+        }
+      } catch (e) {
+        report.erreurs++;
+        report.details.push({ enseigne: it.enseigne || '?', action: 'erreur', message: e.message });
+      }
+    }
+
+    if (!dryRun) await auditLog('IMPORT_RESTAURANTS', req.user.email, { total: report.total, crees: report.crees, enrichis: report.enrichis, erreurs: report.erreurs }, req);
+    res.json({ success: true, dryRun, report: { ...report, details: report.details.slice(0, 50) }, detailsComplets: report.details.length });
+  } catch (e) {
+    console.error('Erreur import-restaurants:', e.message);
+    res.status(500).json({ success: false, error: 'Erreur serveur: ' + e.message });
+  }
+});
 app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
 
 // [FIX OOM] Nettoyage periodique des tournees abandonnees (>48h)
