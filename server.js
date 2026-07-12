@@ -287,6 +287,7 @@ const PUBLIC_API_RULES = [
   { m: 'GET',  t: (p) => p === '/api/health' },
   { m: '*',    t: (p) => p.startsWith('/api/auth/') },
   { m: 'POST', t: (p) => /^\/api\/(collectors|operators|restaurants|transporteurs|recepteurs|certificateurs)\/register$/.test(p) },
+  { m: 'POST', t: (p) => p.startsWith('/api/email-verification/') },
   { m: 'POST', t: (p) => p.startsWith('/api/password-reset/') },
   { m: '*',    t: (p) => p.startsWith('/api/proxy/') },
   { m: 'GET',  t: (p) => p.startsWith('/api/restaurants/siret/') },
@@ -1094,7 +1095,15 @@ app.post('/api/operators/:email/unlock', async (req, res) => {
 // ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
-    const { email, password, confirmPassword, id, qrCode, siret, ...data } = sanitizeObject(req.body);
+    const { email, password, confirmPassword, id, qrCode, siret, emailVerificationCode, ...data } = sanitizeObject(req.body);
+    // [VÉRIF EMAIL] Exiger un code de vérification valide pour l'email fourni.
+    // (L'import admin passe par une autre route et n'est pas concerné.)
+    if (!email || !isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
+    if (!emailVerificationCode) return res.status(400).json({ success: false, error: 'Code de vérification email requis. Mettez à jour l\'application.' });
+    const verif = await verifierCodeEmail(email, emailVerificationCode);
+    if (!verif.ok) return res.status(400).json({ success: false, error: 'Vérification email : ' + verif.error });
+    // Code valide → on le consomme (usage unique)
+    try { await db.collection('email_verifications').deleteOne({ email: sanitizeInput(email) }); } catch (e) {}
     let existingBySiret = null;
     if (siret && db && isConnected) existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
     if (existingBySiret) {
@@ -1117,7 +1126,7 @@ app.post('/api/restaurants/register', async (req, res) => {
     res.status(201).json({ success: true, id: rid, qrCode: newQR });
   } catch (error) { console.error('Erreur register restaurant:', error); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
-app.get('/api/restaurants/pending', async (req, res) => { const r = await getRestaurants('pending'); res.json(r.map(({ password, loginAttempts, lockUntil, ...x }) => x)); });
+app.get('/api/restaurants/pending', async (req, res) => { const r = await getRestaurants('pending'); res.json(r.map(({ password, loginAttempts, lockUntil, ...x }) => ({ ...x, hasPassword: !!password }))); });
 // [FIX 3.2 + 3.3] GET /api/restaurants — Delta support via ?since=
 app.get('/api/restaurants', async (req, res) => {
   try {
@@ -1731,7 +1740,78 @@ createRoleRoutes(app, 'certificateurs', COLLECTIONS.CERTIFICATEURS, 'certificate
 
 // Password reset for transporteurs/recepteurs/certificateurs
 // =============================================================
-// [SÉCU RESET] Récupération de mot de passe — code vérifié CÔTÉ SERVEUR
+// [VÉRIF EMAIL INSCRIPTION] Vérification de l'email avant création de compte
+// Le serveur envoie un code à l'email fourni ; le compte n'est créé (route
+// register) que si le bon code est présenté. Empêche les inscriptions avec
+// un email erroné ou usurpé. Réutilise l'infra Brevo du password-reset.
+// =============================================================
+async function sendVerificationCodeEmail(to, code) {
+  try {
+    const settings = await getSettings();
+    if (!settings.brevoApiKey) return false;
+    const html = '<html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;padding:20px;">' +
+      '<div style="max-width:500px;margin:0 auto;border:1px solid #e5e7eb;border-radius:8px;padding:24px;">' +
+      '<h2 style="color:#6bb44a;">Bienvenue chez UCO AND CO</h2>' +
+      '<p>Pour valider votre adresse email et finaliser votre demande de compte, voici votre code de vérification :</p>' +
+      '<div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#111;background:#f4f4f4;padding:16px;text-align:center;border-radius:6px;">' + code + '</div>' +
+      '<p style="color:#666;font-size:13px;margin-top:16px;">Ce code est valable 15 minutes. Si vous n\'êtes pas à l\'origine de cette demande, ignorez cet email.</p>' +
+      '</div></body></html>';
+    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' }, to: [{ email: to }], subject: 'Votre code de vérification UCO AND CO', htmlContent: html })
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+// Demander un code de vérification email (avant inscription)
+app.post('/api/email-verification/request', strictLimiter, async (req, res) => {
+  try {
+    const { email } = sanitizeObject(req.body);
+    if (!email || !isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
+    await db.collection('email_verifications').updateOne(
+      { email: sanitizeInput(email) },
+      { $set: { email: sanitizeInput(email), codeHash, expires: Date.now() + 15 * 60 * 1000, attempts: 0, createdAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+    const sent = await sendVerificationCodeEmail(email, code);
+    await auditLog('EMAIL_VERIFICATION_REQUEST', email, { sent }, req);
+    // On indique si l'envoi a réussi (utile pour l'UX d'inscription, pas de fuite de données sensibles)
+    res.json({ success: true, sent });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// Vérifier un code (helper interne réutilisable par la route register)
+async function verifierCodeEmail(email, code) {
+  if (!db || !isConnected) return { ok: false, error: 'DB non disponible' };
+  const rec = await db.collection('email_verifications').findOne({ email: sanitizeInput(email) });
+  if (!rec || !rec.codeHash) return { ok: false, error: 'Aucune vérification en cours' };
+  if (Date.now() > (rec.expires || 0)) return { ok: false, error: 'Code expiré' };
+  if ((rec.attempts || 0) >= 5) return { ok: false, error: 'Trop de tentatives' };
+  const valid = await bcrypt.compare(String(code), rec.codeHash);
+  if (!valid) {
+    await db.collection('email_verifications').updateOne({ email: sanitizeInput(email) }, { $inc: { attempts: 1 } });
+    return { ok: false, error: 'Code incorrect' };
+  }
+  return { ok: true };
+}
+
+// Vérifier un code explicitement (optionnel, pour l'UX pas-à-pas)
+app.post('/api/email-verification/verify', strictLimiter, async (req, res) => {
+  try {
+    const { email, code } = sanitizeObject(req.body);
+    if (!email || !code) return res.status(400).json({ success: false, error: 'Email et code requis' });
+    const r = await verifierCodeEmail(email, code);
+    if (!r.ok) return res.status(400).json({ success: false, error: r.error });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+
 // Ancien système : le code était généré/vérifié dans le navigateur et le
 // backend changeait le mot de passe sur simple email (contournable au curl).
 // Nouveau : le serveur génère le code, le stocke HASHÉ avec expiration,
