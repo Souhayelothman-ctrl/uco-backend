@@ -1096,14 +1096,31 @@ app.post('/api/operators/:email/unlock', async (req, res) => {
 app.post('/api/restaurants/register', async (req, res) => {
   try {
     const { email, password, confirmPassword, id, qrCode, siret, emailVerificationCode, ...data } = sanitizeObject(req.body);
-    // [VÉRIF EMAIL] Exiger un code de vérification valide pour l'email fourni.
-    // (L'import admin passe par une autre route et n'est pas concerné.)
-    if (!email || !isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
-    if (!emailVerificationCode) return res.status(400).json({ success: false, error: 'Code de vérification email requis. Mettez à jour l\'application.' });
-    const verif = await verifierCodeEmail(email, emailVerificationCode);
-    if (!verif.ok) return res.status(400).json({ success: false, error: 'Vérification email : ' + verif.error });
-    // Code valide → on le consomme (usage unique)
-    try { await db.collection('email_verifications').deleteOne({ email: sanitizeInput(email) }); } catch (e) {}
+    // [TERRAIN] Un collecteur ou admin AUTHENTIFIÉ (token valide) peut créer un
+    // restaurant sans code de vérification email : c'est le parcours "nouveau
+    // client depuis le terrain". La vérification email ne s'impose qu'aux
+    // auto-inscriptions publiques (non authentifiées).
+    let createdByStaff = false;
+    try {
+      const authHeader = req.headers['authorization'];
+      const tok = authHeader && authHeader.split(' ')[1];
+      if (tok && !tokenBlacklist.has(tok)) {
+        const decoded = verifyToken(tok);
+        if (decoded && ['collector', 'admin'].includes(decoded.role)) createdByStaff = true;
+      }
+    } catch (e) {}
+    // [VÉRIF EMAIL] Exiger un code de vérification valide pour l'email fourni
+    // (auto-inscription uniquement — l'import admin passe par une autre route).
+    if (!createdByStaff) {
+      if (!email || !isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
+      if (!emailVerificationCode) return res.status(400).json({ success: false, error: 'Code de vérification email requis. Mettez à jour l\'application.' });
+      const verif = await verifierCodeEmail(email, emailVerificationCode);
+      if (!verif.ok) return res.status(400).json({ success: false, error: 'Vérification email : ' + verif.error });
+      // Code valide → on le consomme (usage unique)
+      try { await db.collection('email_verifications').deleteOne({ email: sanitizeInput(email) }); } catch (e) {}
+    } else if (email && !isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'Email invalide' });
+    }
     let existingBySiret = null;
     if (siret && db && isConnected) existingBySiret = await db.collection(COLLECTIONS.RESTAURANTS).findOne({ siret });
     if (existingBySiret) {
