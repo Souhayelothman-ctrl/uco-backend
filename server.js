@@ -1730,28 +1730,170 @@ createRoleRoutes(app, 'recepteurs', COLLECTIONS.RECEPTEURS, 'recepteurNumber', '
 createRoleRoutes(app, 'certificateurs', COLLECTIONS.CERTIFICATEURS, 'certificateurNumber', 'CERT');
 
 // Password reset for transporteurs/recepteurs/certificateurs
+// =============================================================
+// [SÉCU RESET] Récupération de mot de passe — code vérifié CÔTÉ SERVEUR
+// Ancien système : le code était généré/vérifié dans le navigateur et le
+// backend changeait le mot de passe sur simple email (contournable au curl).
+// Nouveau : le serveur génère le code, le stocke HASHÉ avec expiration,
+// l'envoie par email/SMS, et n'accepte le changement qu'avec le bon code.
+// =============================================================
+const RESET_COLL_MAP = {
+  transporteurs: COLLECTIONS.TRANSPORTEURS, recepteurs: COLLECTIONS.RECEPTEURS,
+  certificateurs: COLLECTIONS.CERTIFICATEURS, collectors: COLLECTIONS.COLLECTORS,
+  operators: COLLECTIONS.OPERATORS, restaurants: COLLECTIONS.RESTAURANTS
+};
+
+// Helper interne : envoi email via Brevo (réutilise la config settings)
+async function sendResetEmail(to, code) {
+  try {
+    const settings = await getSettings();
+    if (!settings.brevoApiKey) return false;
+    const html = '<html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;padding:20px;">' +
+      '<div style="max-width:500px;margin:0 auto;border:1px solid #e5e7eb;border-radius:8px;padding:24px;">' +
+      '<h2 style="color:#6bb44a;">Réinitialisation de mot de passe</h2>' +
+      '<p>Votre code de vérification UCO AND CO :</p>' +
+      '<div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#111;background:#f4f4f4;padding:16px;text-align:center;border-radius:6px;">' + code + '</div>' +
+      '<p style="color:#666;font-size:13px;margin-top:16px;">Ce code est valable 15 minutes. Si vous n\'êtes pas à l\'origine de cette demande, ignorez cet email.</p>' +
+      '</div></body></html>';
+    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' }, to: [{ email: to }], subject: 'Votre code de réinitialisation UCO AND CO', htmlContent: html })
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+async function sendResetSMS(to, code) {
+  try {
+    const settings = await getSettings();
+    if (!settings.brevoApiKey || !settings.smsEnabled) return false;
+    let phone = typeof to === 'object' ? to.number : to;
+    let cc = typeof to === 'object' ? to.countryCode : 'FR';
+    phone = String(phone).replace(/[\s.\-]/g, '');
+    const prefixes = { 'FR': '+33', 'BE': '+32', 'CH': '+41', 'LU': '+352' };
+    const prefix = prefixes[cc] || '+33';
+    if (!phone.startsWith('+')) phone = phone.startsWith('0') ? prefix + phone.slice(1) : prefix + phone;
+    const r = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+      method: 'POST',
+      headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ sender: 'UCOANDCO', recipient: phone, content: 'UCO AND CO - Votre code de reinitialisation : ' + code + ' (valable 15 min)' })
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+// ÉTAPE 1 — Demander un code : le serveur génère, stocke (hashé), envoie
+app.post('/api/password-reset/:role/request', async (req, res) => {
+  try {
+    const { role } = req.params;
+    const { email, method } = sanitizeObject(req.body);
+    const coll = RESET_COLL_MAP[role];
+    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (!email) return res.status(400).json({ success: false, error: 'Email requis' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+
+    const user = await db.collection(coll).findOne({ email });
+    // Réponse identique que le compte existe ou non (anti-énumération)
+    const genericOk = { success: true, message: 'Si un compte existe, un code a été envoyé.' };
+    if (!user) return res.json(genericOk);
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
+    const expires = Date.now() + 15 * 60 * 1000;
+    await db.collection(coll).updateOne({ email }, { $set: { resetCodeHash: codeHash, resetCodeExpires: expires, resetCodeAttempts: 0 } });
+
+    let sent = false;
+    if (method === 'sms' && user.tel) sent = await sendResetSMS(user.tel, code);
+    else sent = await sendResetEmail(email, code);
+
+    await auditLog(role.toUpperCase() + '_RESET_REQUEST', email, { method: method || 'email', sent }, req);
+    // On ne divulgue jamais le code dans la réponse
+    return res.json(genericOk);
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// ÉTAPE 2 — Vérifier le code (optionnel, pour l'UX pas-à-pas)
+app.post('/api/password-reset/:role/verify', async (req, res) => {
+  try {
+    const { role } = req.params;
+    const { email, code } = sanitizeObject(req.body);
+    const coll = RESET_COLL_MAP[role];
+    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (!email || !code) return res.status(400).json({ success: false, error: 'Email et code requis' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+
+    const user = await db.collection(coll).findOne({ email });
+    if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
+    if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré' });
+    if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
+
+    const valid = await bcrypt.compare(code, user.resetCodeHash);
+    if (!valid) {
+      await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } });
+      return res.status(401).json({ success: false, error: 'Code incorrect' });
+    }
+    return res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// ÉTAPE 3 — Confirmer : exige email + code valide + nouveau mot de passe
+app.post('/api/password-reset/:role/confirm', async (req, res) => {
+  try {
+    const { role } = req.params;
+    const { email, code, newPassword } = sanitizeObject(req.body);
+    const coll = RESET_COLL_MAP[role];
+    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (!email || !code || !newPassword) return res.status(400).json({ success: false, error: 'Email, code et nouveau mot de passe requis' });
+    if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court (8 caractères min)' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+
+    const user = await db.collection(coll).findOne({ email });
+    if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
+    if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
+    if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives, recommencez' });
+
+    const valid = await bcrypt.compare(code, user.resetCodeHash);
+    if (!valid) {
+      await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } });
+      return res.status(401).json({ success: false, error: 'Code incorrect' });
+    }
+
+    // Code OK → changer le mot de passe ET invalider le code (à usage unique)
+    await db.collection(coll).updateOne({ email }, {
+      $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      $unset: { resetCodeHash: '', resetCodeExpires: '', resetCodeAttempts: '', tempPassword: '', _tempPassword: '' }
+    });
+    await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, { via: 'code_verifie_serveur' }, req);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+// [COMPAT] Ancienne route — DÉSORMAIS elle exige aussi le code (ne change plus
+// le mot de passe sur simple email). Maintenue le temps que les anciennes APK
+// migrent vers /confirm. Redirige vers la logique sécurisée.
 app.post('/api/password-reset/:role', async (req, res) => {
   try {
     const { role } = req.params;
-    const { email, newPassword } = sanitizeObject(req.body);
-    const collMap = { 
-      transporteurs: COLLECTIONS.TRANSPORTEURS, 
-      recepteurs: COLLECTIONS.RECEPTEURS, 
-      certificateurs: COLLECTIONS.CERTIFICATEURS,
-      collectors: COLLECTIONS.COLLECTORS,
-      operators: COLLECTIONS.OPERATORS,
-      restaurants: COLLECTIONS.RESTAURANTS
-    };
-    const coll = collMap[role];
+    const { email, code, newPassword } = sanitizeObject(req.body);
+    const coll = RESET_COLL_MAP[role];
     if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (!code) return res.status(400).json({ success: false, error: 'Code de vérification requis. Mettez à jour l\'application.' });
     if (!email || !newPassword) return res.status(400).json({ success: false, error: 'Email et nouveau mot de passe requis' });
-    if (newPassword.length < 6) return res.status(400).json({ success: false, error: 'Mot de passe trop court' });
-    // Restaurants use email field, others use email as _id
-    const query = role === 'restaurants' ? { email } : { email };
-    const user = await db.collection(coll).findOne(query);
-    if (!user) return res.status(404).json({ success: false, error: 'Compte non trouve' });
-    await db.collection(coll).updateOne(query, { $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() } });
-    await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, {}, req);
+    if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court (8 caractères min)' });
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
+
+    const user = await db.collection(coll).findOne({ email });
+    if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
+    if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
+    if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
+    const valid = await bcrypt.compare(code, user.resetCodeHash);
+    if (!valid) { await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } }); return res.status(401).json({ success: false, error: 'Code incorrect' }); }
+    await db.collection(coll).updateOne({ email }, {
+      $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      $unset: { resetCodeHash: '', resetCodeExpires: '', resetCodeAttempts: '', tempPassword: '', _tempPassword: '' }
+    });
+    await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, { via: 'legacy_avec_code' }, req);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
