@@ -1242,7 +1242,7 @@ app.get('/api/collections', async (req, res) => {
     const skip = (page - 1) * limit;
     const since = req.query.since;
     
-    const projection = { colSignature: 0, restoSignature: 0, bsdPdfBase64: 0, signatureData: 0 };
+    const projection = { colSignature: 0, restoSignature: 0, bsdPdfBase64: 0, signatureData: 0, 'bordereau.base64': 0, 'autoFacture.base64': 0 };
     let query = {};
     
     // [FIX 3.3] Si le client envoie ?since=ISO_DATE, ne renvoyer que les collectes modifiées depuis
@@ -1298,6 +1298,21 @@ app.get('/api/collections/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // [FIX 1.8] POST /api/collections — Validation complète
+// [FIX BORDEREAU] Mise à jour d'une collecte (persistance du bordereau PDF généré
+// sur le terrain, autofactures, etc.). Authentifié via la garde globale.
+app.put('/api/collections/:id', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    const updates = sanitizeObject(req.body);
+    delete updates._id; delete updates.id; delete updates.restaurantId;
+    const set = { ...updates, updatedAt: new Date().toISOString() };
+    let r = await db.collection(COLLECTIONS.COLLECTIONS).updateOne({ _id: req.params.id }, { $set: set });
+    if (!r.matchedCount) r = await db.collection(COLLECTIONS.COLLECTIONS).updateOne({ id: req.params.id }, { $set: set });
+    if (!r.matchedCount) return res.status(404).json({ success: false, error: 'Collecte non trouvee' });
+    res.json({ success: true });
+  } catch (e) { console.error('Erreur update collection:', e.message); res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
 app.post('/api/collections', async (req, res) => {
   try {
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
