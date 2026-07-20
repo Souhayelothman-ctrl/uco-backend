@@ -1315,72 +1315,65 @@ app.get('/api/collections/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // [FIX 1.8] POST /api/collections — Validation complète
-// [BACKUP] Export complet de la base pour sauvegarde — réservé au rôle admin.
-// Exclut les PDF stockés (bordereau/autoFacture base64 : régénérables) pour garder
-// un fichier raisonnable, mais INCLUT les signatures (nécessaires à la régénération).
+// [BACKUP v2 — STREAMING] Export complet de la base pour sauvegarde — réservé admin.
+// RÉÉCRIT après incident mémoire (512 Mo dépassés le 21/07) : l'ancienne version
+// chargeait les 15 collections EN PARALLÈLE puis sérialisait un JSON géant → crash.
+// Désormais : lecture SÉQUENTIELLE, écriture en streaming dans la réponse — le pic
+// mémoire se limite à UNE collection à la fois. Les PDF régénérables (bordereaux,
+// autofactures, BSD) sont exclus ; les signatures sont conservées.
 app.get('/api/admin/full-backup', async (req, res) => {
   try {
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
-    // Vérification du rôle admin (la garde globale a déjà validé le token)
     const authHeader = req.headers['authorization'];
     const tok = authHeader && authHeader.split(' ')[1];
     const decoded = tok ? verifyToken(tok) : null;
     if (!decoded || decoded.role !== 'admin') return res.status(403).json({ success: false, error: 'Réservé au superviseur' });
     
-    const dump = async (name, projection = null, limit = 0, sort = null) => {
-      let cur = db.collection(name).find({}, projection ? { projection } : {});
-      if (sort) cur = cur.sort(sort);
-      if (limit) cur = cur.limit(limit);
-      return cur.toArray();
-    };
+    const noPdf = { 'bordereau.base64': 0, 'autoFacture.base64': 0, bsdPdfBase64: 0 };
+    const stripPassword = (arr) => arr.map(({ password, ...rest }) => rest);
     
-    const [restaurants, collections, collectors, operators, transporteurs, recepteurs,
-           certificateurs, prestataires, expeditions, tournees, settings, auditLogs,
-           avis, dailyVolumes, campaigns] = await Promise.all([
-      dump(COLLECTIONS.RESTAURANTS),
-      dump(COLLECTIONS.COLLECTIONS, { 'bordereau.base64': 0, 'autoFacture.base64': 0, bsdPdfBase64: 0 }),
-      dump(COLLECTIONS.COLLECTORS),
-      dump(COLLECTIONS.OPERATORS),
-      dump(COLLECTIONS.TRANSPORTEURS),
-      dump(COLLECTIONS.RECEPTEURS),
-      dump(COLLECTIONS.CERTIFICATEURS),
-      dump(COLLECTIONS.PRESTATAIRES),
-      dump(COLLECTIONS.EXPEDITIONS),
-      dump(COLLECTIONS.TOURNEES),
-      dump(COLLECTIONS.SETTINGS),
-      dump(COLLECTIONS.AUDIT_LOGS, null, 10000, { timestamp: -1 }),
-      dump(COLLECTIONS.AVIS),
-      dump(COLLECTIONS.DAILY_VOLUMES),
-      dump(COLLECTIONS.CAMPAIGNS)
-    ]);
+    // (nom exporté, collection Mongo, projection, limite, tri, purge mot de passe)
+    const specs = [
+      ['restaurants',     COLLECTIONS.RESTAURANTS,     null,  0,    null,               true],
+      ['collections',     COLLECTIONS.COLLECTIONS,     noPdf, 0,    null,               false],
+      ['collectors',      COLLECTIONS.COLLECTORS,      null,  0,    null,               true],
+      ['operators',       COLLECTIONS.OPERATORS,       null,  0,    null,               true],
+      ['transporteurs',   COLLECTIONS.TRANSPORTEURS,   null,  0,    null,               true],
+      ['recepteurs',      COLLECTIONS.RECEPTEURS,      null,  0,    null,               true],
+      ['certificateurs',  COLLECTIONS.CERTIFICATEURS,  null,  0,    null,               true],
+      ['prestataires',    COLLECTIONS.PRESTATAIRES,    null,  0,    null,               false],
+      ['expeditions',     COLLECTIONS.EXPEDITIONS,     noPdf, 0,    null,               false],
+      ['tournees',        COLLECTIONS.TOURNEES,        null,  0,    null,               false],
+      ['settings',        COLLECTIONS.SETTINGS,        null,  0,    null,               false],
+      ['auditLogs',       COLLECTIONS.AUDIT_LOGS,      null,  5000, { timestamp: -1 },  false],
+      ['avis',            COLLECTIONS.AVIS,            null,  0,    null,               false],
+      ['dailyVolumes',    COLLECTIONS.DAILY_VOLUMES,   null,  0,    null,               false],
+      ['campaigns',       COLLECTIONS.CAMPAIGNS,       null,  0,    null,               false]
+    ];
     
-    // Purger les champs sensibles (mots de passe hashés) du backup
-    const strip = (arr) => arr.map(({ password, ...rest }) => rest);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.write('{"success":true,"metadata":' + JSON.stringify({ date: new Date().toISOString(), source: 'mongodb', version: '2.1-stream' }) + ',"data":{');
     
-    res.json({
-      success: true,
-      metadata: { date: new Date().toISOString(), source: 'mongodb', version: '2.0' },
-      data: {
-        restaurants: strip(restaurants),
-        collections,
-        collectors: strip(collectors),
-        operators: strip(operators),
-        transporteurs: strip(transporteurs),
-        recepteurs: strip(recepteurs),
-        certificateurs: strip(certificateurs),
-        prestataires,
-        expeditions,
-        tournees,
-        settings,
-        auditLogs,
-        avis,
-        dailyVolumes,
-        campaigns
-      }
-    });
+    for (let s = 0; s < specs.length; s++) {
+      const [name, collName, projection, limit, sort, purge] = specs[s];
+      let arr = [];
+      try {
+        let cur = db.collection(collName).find({}, projection ? { projection } : {});
+        if (sort) cur = cur.sort(sort);
+        if (limit) cur = cur.limit(limit);
+        arr = await cur.toArray();
+        if (purge) arr = stripPassword(arr);
+      } catch (e) { arr = []; }
+      res.write((s > 0 ? ',' : '') + JSON.stringify(name) + ':' + JSON.stringify(arr));
+      arr = null; // libérer avant la collection suivante
+    }
+    
+    res.write('}}');
+    res.end();
   } catch (e) {
     console.error('Erreur full-backup:', e.message);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
+    if (!res.headersSent) res.status(500).json({ success: false, error: 'Erreur serveur' });
+    else try { res.end(); } catch (e2) {}
   }
 });
 
