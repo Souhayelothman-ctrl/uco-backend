@@ -818,7 +818,7 @@ app.get('/api/bulk-data', async (req, res) => {
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, pendingOperators, approvedOperators, expeditions, avisClients, adminSettings] = await Promise.all([
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'deleted' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(limit).toArray().catch(() => []),
       db.collection(COLLECTIONS.PENDING_RESTAURANTS).find({}, { projection: { password: 0 } }).limit(limit).toArray().catch(() => []),
-      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0, 'bordereau.base64': 0, 'autoFacture.base64': 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
       db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.PENDING_OPERATORS || 'pending_operators').find({}).limit(100).toArray().catch(() => []),
@@ -856,7 +856,7 @@ app.get('/api/bulk-load', async (req, res) => {
            pendingOperators, approvedOperators, expeditions, demandesCollecte] = await Promise.all([
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(500).toArray(),
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(100).toArray(),
-      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0 } }).sort({ date: -1 }).limit(2000).toArray(),
+      db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0, 'bordereau.base64': 0, 'autoFacture.base64': 0 } }).sort({ date: -1 }).limit(2000).toArray(),
       db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray(),
       db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray(),
       db.collection('pending_operators').find({}).limit(100).toArray(),
