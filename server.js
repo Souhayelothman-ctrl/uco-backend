@@ -1315,12 +1315,12 @@ app.get('/api/collections/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // [FIX 1.8] POST /api/collections — Validation complète
-// [BACKUP v2 — STREAMING] Export complet de la base pour sauvegarde — réservé admin.
-// RÉÉCRIT après incident mémoire (512 Mo dépassés le 21/07) : l'ancienne version
-// chargeait les 15 collections EN PARALLÈLE puis sérialisait un JSON géant → crash.
-// Désormais : lecture SÉQUENTIELLE, écriture en streaming dans la réponse — le pic
-// mémoire se limite à UNE collection à la fois. Les PDF régénérables (bordereaux,
-// autofactures, BSD) sont exclus ; les signatures sont conservées.
+// [BACKUP v2.2 — STREAMING DOCUMENT PAR DOCUMENT AVEC CONTRE-PRESSION]
+// v2.1 (streaming par collection) a ENCORE dépassé les 512 Mo le 21/07 à 01h10 :
+// res.write() en boucle rapide sans attendre le drainage réseau → tout le JSON
+// s'accumulait dans le tampon de Node (= tout en mémoire, comme avant).
+// v2.2 : curseur document par document + write() qui ATTEND l'événement 'drain'
+// quand le tampon est plein. Pic mémoire = un document. Logs par collection.
 app.get('/api/admin/full-backup', async (req, res) => {
   try {
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
@@ -1329,10 +1329,16 @@ app.get('/api/admin/full-backup', async (req, res) => {
     const decoded = tok ? verifyToken(tok) : null;
     if (!decoded || decoded.role !== 'admin') return res.status(403).json({ success: false, error: 'Réservé au superviseur' });
     
-    const noPdf = { 'bordereau.base64': 0, 'autoFacture.base64': 0, bsdPdfBase64: 0 };
-    const stripPassword = (arr) => arr.map(({ password, ...rest }) => rest);
+    // Écriture respectant la contre-pression : si le tampon est plein (write
+    // renvoie false), on attend 'drain' avant de continuer → la mémoire ne
+    // gonfle jamais au-delà du highWaterMark (~16 Ko).
+    const writeAsync = (chunk) => new Promise((resolve, reject) => {
+      res.once('error', reject);
+      if (res.write(chunk)) { res.removeListener('error', reject); resolve(); }
+      else res.once('drain', () => { res.removeListener('error', reject); resolve(); });
+    });
     
-    // (nom exporté, collection Mongo, projection, limite, tri, purge mot de passe)
+    const noPdf = { 'bordereau.base64': 0, 'autoFacture.base64': 0, bsdPdfBase64: 0 };
     const specs = [
       ['restaurants',     COLLECTIONS.RESTAURANTS,     null,  0,    null,               true],
       ['collections',     COLLECTIONS.COLLECTIONS,     noPdf, 0,    null,               false],
@@ -1352,24 +1358,30 @@ app.get('/api/admin/full-backup', async (req, res) => {
     ];
     
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.write('{"success":true,"metadata":' + JSON.stringify({ date: new Date().toISOString(), source: 'mongodb', version: '2.1-stream' }) + ',"data":{');
+    await writeAsync('{"success":true,"metadata":' + JSON.stringify({ date: new Date().toISOString(), source: 'mongodb', version: '2.2-stream' }) + ',"data":{');
     
     for (let s = 0; s < specs.length; s++) {
       const [name, collName, projection, limit, sort, purge] = specs[s];
-      let arr = [];
+      await writeAsync((s > 0 ? ',' : '') + JSON.stringify(name) + ':[');
+      let count = 0, bytes = 0, maxDoc = 0;
       try {
         let cur = db.collection(collName).find({}, projection ? { projection } : {});
         if (sort) cur = cur.sort(sort);
         if (limit) cur = cur.limit(limit);
-        arr = await cur.toArray();
-        if (purge) arr = stripPassword(arr);
-      } catch (e) { arr = []; }
-      res.write((s > 0 ? ',' : '') + JSON.stringify(name) + ':' + JSON.stringify(arr));
-      arr = null; // libérer avant la collection suivante
+        for await (const doc of cur) {
+          if (purge && doc.password !== undefined) delete doc.password;
+          const chunk = (count > 0 ? ',' : '') + JSON.stringify(doc);
+          await writeAsync(chunk);
+          count++; bytes += chunk.length; if (chunk.length > maxDoc) maxDoc = chunk.length;
+        }
+      } catch (e) { console.error(`full-backup ${name}:`, e.message); }
+      await writeAsync(']');
+      console.log(`full-backup ${name}: ${count} docs, ${(bytes/1024/1024).toFixed(2)} Mo, plus gros doc ${(maxDoc/1024).toFixed(1)} Ko`);
     }
     
-    res.write('}}');
+    await writeAsync('}}');
     res.end();
+    console.log('full-backup terminé');
   } catch (e) {
     console.error('Erreur full-backup:', e.message);
     if (!res.headersSent) res.status(500).json({ success: false, error: 'Erreur serveur' });
