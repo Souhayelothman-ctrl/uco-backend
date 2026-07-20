@@ -1298,6 +1298,75 @@ app.get('/api/collections/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Erreur serveur' }); }
 });
 // [FIX 1.8] POST /api/collections — Validation complète
+// [BACKUP] Export complet de la base pour sauvegarde — réservé au rôle admin.
+// Exclut les PDF stockés (bordereau/autoFacture base64 : régénérables) pour garder
+// un fichier raisonnable, mais INCLUT les signatures (nécessaires à la régénération).
+app.get('/api/admin/full-backup', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    // Vérification du rôle admin (la garde globale a déjà validé le token)
+    const authHeader = req.headers['authorization'];
+    const tok = authHeader && authHeader.split(' ')[1];
+    const decoded = tok ? verifyToken(tok) : null;
+    if (!decoded || decoded.role !== 'admin') return res.status(403).json({ success: false, error: 'Réservé au superviseur' });
+    
+    const dump = async (name, projection = null, limit = 0, sort = null) => {
+      let cur = db.collection(name).find({}, projection ? { projection } : {});
+      if (sort) cur = cur.sort(sort);
+      if (limit) cur = cur.limit(limit);
+      return cur.toArray();
+    };
+    
+    const [restaurants, collections, collectors, operators, transporteurs, recepteurs,
+           certificateurs, prestataires, expeditions, tournees, settings, auditLogs,
+           avis, dailyVolumes, campaigns] = await Promise.all([
+      dump(COLLECTIONS.RESTAURANTS),
+      dump(COLLECTIONS.COLLECTIONS, { 'bordereau.base64': 0, 'autoFacture.base64': 0, bsdPdfBase64: 0 }),
+      dump(COLLECTIONS.COLLECTORS),
+      dump(COLLECTIONS.OPERATORS),
+      dump(COLLECTIONS.TRANSPORTEURS),
+      dump(COLLECTIONS.RECEPTEURS),
+      dump(COLLECTIONS.CERTIFICATEURS),
+      dump(COLLECTIONS.PRESTATAIRES),
+      dump(COLLECTIONS.EXPEDITIONS),
+      dump(COLLECTIONS.TOURNEES),
+      dump(COLLECTIONS.SETTINGS),
+      dump(COLLECTIONS.AUDIT_LOGS, null, 10000, { timestamp: -1 }),
+      dump(COLLECTIONS.AVIS),
+      dump(COLLECTIONS.DAILY_VOLUMES),
+      dump(COLLECTIONS.CAMPAIGNS)
+    ]);
+    
+    // Purger les champs sensibles (mots de passe hashés) du backup
+    const strip = (arr) => arr.map(({ password, ...rest }) => rest);
+    
+    res.json({
+      success: true,
+      metadata: { date: new Date().toISOString(), source: 'mongodb', version: '2.0' },
+      data: {
+        restaurants: strip(restaurants),
+        collections,
+        collectors: strip(collectors),
+        operators: strip(operators),
+        transporteurs: strip(transporteurs),
+        recepteurs: strip(recepteurs),
+        certificateurs: strip(certificateurs),
+        prestataires,
+        expeditions,
+        tournees,
+        settings,
+        auditLogs,
+        avis,
+        dailyVolumes,
+        campaigns
+      }
+    });
+  } catch (e) {
+    console.error('Erreur full-backup:', e.message);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // [FIX BORDEREAU] Mise à jour d'une collecte (persistance du bordereau PDF généré
 // sur le terrain, autofactures, etc.). Authentifié via la garde globale.
 app.put('/api/collections/:id', async (req, res) => {
