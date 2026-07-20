@@ -646,7 +646,21 @@ async function deleteOperator(email) { if (!db || !isConnected) return false; tr
 async function getRestaurants(status = null) { if (!db || !isConnected) return []; try { const q = status ? { status } : {}; return await db.collection(COLLECTIONS.RESTAURANTS).find(q, { projection: { contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).toArray(); } catch (e) { return []; } }
 async function getRestaurantById(id) { if (!db || !isConnected) return null; try { const s = sanitizeInput(id); return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ $or: [{ id: s }, { siret: s }, { qrCode: s }] }); } catch (e) { return null; } }
 async function getRestaurantByQRCode(qrCode) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ qrCode: sanitizeInput(qrCode) }); } catch (e) { return null; } }
-async function getRestaurantByEmail(email) { if (!db || !isConnected) return null; try { return await db.collection(COLLECTIONS.RESTAURANTS).findOne({ email: sanitizeInput(email) }); } catch (e) { return null; } }
+// [FIX CASSE EMAIL] Recherche par email INSENSIBLE à la casse. Les claviers mobiles
+// mettent une majuscule automatique ("Royalplace25@…") alors que l'utilisateur tape
+// en minuscules à la connexion → "compte introuvable". Essai exact d'abord (indexé),
+// puis repli regex ancré insensible à la casse.
+function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+async function findOneByEmailCI(collName, email) {
+  if (!db || !isConnected) return null;
+  try {
+    const e = sanitizeInput(email);
+    let doc = await db.collection(collName).findOne({ email: e });
+    if (!doc) doc = await db.collection(collName).findOne({ email: { $regex: `^${escapeRegex(e)}$`, $options: 'i' } });
+    return doc;
+  } catch (err) { return null; }
+}
+async function getRestaurantByEmail(email) { return findOneByEmailCI(COLLECTIONS.RESTAURANTS, email); }
 async function addRestaurant(restaurant) { if (!db || !isConnected) return null; try { const s = sanitizeObject(restaurant); return (await db.collection(COLLECTIONS.RESTAURANTS).insertOne({ ...s, _id: s.id, loginAttempts: 0, lockUntil: null, createdAt: new Date().toISOString() })).insertedId; } catch (e) { console.error('Erreur addRestaurant:', e.message); return null; } }
 async function updateRestaurant(id, data) { if (!db || !isConnected) return false; try { const s = sanitizeInput(id); await db.collection(COLLECTIONS.RESTAURANTS).updateOne({ $or: [{ id: s }, { siret: s }, { qrCode: s }] }, { $set: { ...sanitizeObject(data), updatedAt: new Date().toISOString() } }); return true; } catch (e) { return false; } }
 async function deleteRestaurant(id) { if (!db || !isConnected) return false; try { await db.collection(COLLECTIONS.RESTAURANTS).deleteOne({ id: sanitizeInput(id) }); return true; } catch (e) { return false; } }
@@ -1095,7 +1109,10 @@ app.post('/api/operators/:email/unlock', async (req, res) => {
 // ===== RESTAURANTS CRUD =====
 app.post('/api/restaurants/register', async (req, res) => {
   try {
-    const { email, password, confirmPassword, id, qrCode, siret, emailVerificationCode, ...data } = sanitizeObject(req.body);
+    const { email: emailRaw, password, confirmPassword, id, qrCode, siret, emailVerificationCode, ...data } = sanitizeObject(req.body);
+    // [FIX CASSE EMAIL] Normaliser l'email en minuscules dès la création (les
+    // majuscules automatiques des claviers mobiles créaient des comptes introuvables)
+    const email = (emailRaw || '').trim().toLowerCase();
     // [VÉRIF EMAIL] Code de vérification OBLIGATOIRE pour toute création via register,
     // y compris les créations terrain par un collecteur : le gérant reçoit le code sur
     // son téléphone et le communique au collecteur. Garantit un email valide dès la
@@ -1712,7 +1729,7 @@ function createRoleRoutes(app, roleName, collectionName, numberField, numberPref
     try {
       const { email, password } = sanitizeObject(req.body);
       if (!email || !password) return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
-      const user = await db.collection(collectionName).findOne({ email });
+      const user = await findOneByEmailCI(collectionName, email);
       if (!user) return res.status(401).json({ success: false, error: 'Compte non trouve' });
       if (user.status === 'pending') return res.json({ success: false, error: 'pending' });
       if (user.status !== 'approved') return res.status(401).json({ success: false, error: 'Compte non approuve' });
@@ -1856,13 +1873,14 @@ async function sendVerificationCodeEmail(to, code) {
 app.post('/api/email-verification/request', strictLimiter, async (req, res) => {
   try {
     const { email } = sanitizeObject(req.body);
+    const emailNorm = (email || '').trim().toLowerCase();
     if (!email || !isValidEmail(email)) return res.status(400).json({ success: false, error: 'Email invalide' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
     const code = String(Math.floor(100000 + Math.random() * 900000));
     const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
     await db.collection('email_verifications').updateOne(
-      { email: sanitizeInput(email) },
-      { $set: { email: sanitizeInput(email), codeHash, expires: Date.now() + 15 * 60 * 1000, attempts: 0, createdAt: new Date().toISOString() } },
+      { email: sanitizeInput(emailNorm) },
+      { $set: { email: sanitizeInput(emailNorm), codeHash, expires: Date.now() + 15 * 60 * 1000, attempts: 0, createdAt: new Date().toISOString() } },
       { upsert: true }
     );
     const sent = await sendVerificationCodeEmail(email, code);
@@ -1873,8 +1891,9 @@ app.post('/api/email-verification/request', strictLimiter, async (req, res) => {
 });
 
 // Vérifier un code (helper interne réutilisable par la route register)
-async function verifierCodeEmail(email, code) {
+async function verifierCodeEmail(emailRaw, code) {
   if (!db || !isConnected) return { ok: false, error: 'DB non disponible' };
+  const email = (emailRaw || '').trim().toLowerCase();
   const rec = await db.collection('email_verifications').findOne({ email: sanitizeInput(email) });
   if (!rec || !rec.codeHash) return { ok: false, error: 'Aucune vérification en cours' };
   if (Date.now() > (rec.expires || 0)) return { ok: false, error: 'Code expiré' };
@@ -1960,7 +1979,7 @@ app.post('/api/password-reset/:role/request', async (req, res) => {
     if (!email) return res.status(400).json({ success: false, error: 'Email requis' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await db.collection(coll).findOne({ email });
+    const user = await findOneByEmailCI(coll, email);
     // Réponse identique que le compte existe ou non (anti-énumération)
     const genericOk = { success: true, message: 'Si un compte existe, un code a été envoyé.' };
     if (!user) return res.json(genericOk);
@@ -1990,7 +2009,7 @@ app.post('/api/password-reset/:role/verify', async (req, res) => {
     if (!email || !code) return res.status(400).json({ success: false, error: 'Email et code requis' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await db.collection(coll).findOne({ email });
+    const user = await findOneByEmailCI(coll, email);
     if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
@@ -2015,7 +2034,7 @@ app.post('/api/password-reset/:role/confirm', async (req, res) => {
     if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court (8 caractères min)' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await db.collection(coll).findOne({ email });
+    const user = await findOneByEmailCI(coll, email);
     if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives, recommencez' });
@@ -2050,7 +2069,7 @@ app.post('/api/password-reset/:role', async (req, res) => {
     if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court (8 caractères min)' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await db.collection(coll).findOne({ email });
+    const user = await findOneByEmailCI(coll, email);
     if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
