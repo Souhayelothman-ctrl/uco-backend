@@ -298,7 +298,12 @@ const PUBLIC_API_RULES = [
 ];
 app.use('/api', (req, res, next) => {
   const path = (req.baseUrl + req.path).split('?')[0].replace(/\/+$/, '') || req.baseUrl;
-  const isPublic = PUBLIC_API_RULES.some(r => (r.m === '*' || r.m === req.method) && r.t(path));
+  // [VIGILANCE] HEAD = GET sans body (norme HTTP). On normalise HEAD → GET
+  // pour que la liste blanche s'applique aussi aux monitors (UptimeRobot
+  // envoie des HEAD). NE PAS supprimer : sinon /api/health repasse en 401
+  // pour les HEAD et le monitoring retombe en "down". (Fix incident 11/07/2026)
+  const method = req.method === 'HEAD' ? 'GET' : req.method;
+  const isPublic = PUBLIC_API_RULES.some(r => (r.m === '*' || r.m === method) && r.t(path));
   if (isPublic) return next();
   return authenticateToken(req, res, next);
 });
