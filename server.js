@@ -2748,6 +2748,179 @@ app.post('/api/admin/import-restaurants', authenticateToken, requireRole('admin'
     res.status(500).json({ success: false, error: 'Erreur serveur: ' + e.message });
   }
 });
+
+// =============================================================
+// [FINALIZE] Génération SERVEUR du bordereau + email (PDF joint) + SMS
+// POST /api/collections/:id/finalize   → répond 202 immédiatement, travaille en fond
+// GET  /api/collections/:id/finalize   → statut { status, emailSent, smsSent, error }
+//
+// À COLLER dans server.js JUSTE AVANT :
+//   app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
+//
+// Prérequis :
+//   - fichier utils/bordereau-pdf.js (fourni)
+//   - fichier utils/logo-uco.b64 (fourni — logo PNG en base64, une seule ligne)
+//   - pdfkit déjà présent dans package.json (il est déjà require() en tête de server.js)
+// Tous les helpers utilisés (db, COLLECTIONS, getSettings, sanitizeInput,
+// downloadFromR2, uploadToR2, initS3, auditLog, fetch) sont déjà définis plus haut.
+// =============================================================
+const { generateBordereauPDF: _genBordereau } = require('./utils/bordereau-pdf');
+let _logoUcoPng = null;
+try {
+  _logoUcoPng = Buffer.from(require('fs').readFileSync(require('path').join(__dirname, 'utils', 'logo-uco.b64'), 'utf8').trim(), 'base64');
+} catch (e) { console.warn('[FINALIZE] logo-uco.b64 introuvable — bordereau sans logo image'); }
+
+// Email récapitulatif (même contenu que l'ancien sendBordereauEmail du frontend) + PDF joint
+async function _sendBordereauEmailBrevo(to, col, numeroOrdre, pdfBuffer, filename) {
+  const settings = await getSettings();
+  if (!settings.brevoApiKey) return { sent: false, error: 'Brevo non configuré' };
+  const d = col.date ? new Date(col.date) : new Date();
+  const dateFormatted = isNaN(d.getTime()) ? 'N/A' : d.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const colNum = parseInt(col.collectorNumber) || 0;
+  const collecteur = col.collectorName || (colNum > 0 ? `COL-${String(colNum).padStart(3, '0')}` : 'N/A');
+  const cond = col.conditionnement?.type
+    ? `${col.conditionnement.type}${col.conditionnement.type === 'Fûts' ? ` (${col.conditionnement.nombreFuts || 0} × ${col.conditionnement.volumeFut || 0}L)` : ''}`
+    : '-';
+  const html = '<html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;padding:20px;">' +
+    '<div style="max-width:600px;margin:0 auto;">' +
+    '<div style="background:#ffffff;padding:18px;text-align:center;border-bottom:4px solid #6bb44a;">' +
+    '<span style="font-size:30px;font-weight:800;"><span style="color:#6bb44a;">uco and </span><span style="color:#ffbd59;">co.</span></span></div>' +
+    '<div style="padding:20px;background:#f9f9f9;">' +
+    `<h2>Bordereau de collecte N° ${numeroOrdre}</h2><p>Bonjour,</p>` +
+    `<p>Nous vous confirmons la collecte d'huiles alimentaires usagées effectuée le <strong>${dateFormatted}</strong>.</p>` +
+    '<div style="background:white;border:1px solid #ddd;padding:15px;margin:20px 0;"><h3 style="margin-top:0;color:#4a7c59;">Récapitulatif de la collecte</h3>' +
+    `<p><strong>Volume collecté :</strong> ${col.volume || 0} Litres</p><p><strong>Conditionnement :</strong> ${cond}</p>` +
+    `<p><strong>Montant :</strong> ${col.price || 0} €</p><p><strong>Collecteur :</strong> ${collecteur}</p></div>` +
+    '<p>Votre bordereau d\'enlèvement signé est joint à cet email (PDF) et reste disponible dans votre espace client.</p>' +
+    '<p>Merci de votre confiance.</p><p>L\'équipe UCO AND CO</p></div>' +
+    '<div style="background:#333;color:white;padding:15px;text-align:center;font-size:12px;"><p>UCO AND CO - Collecte et valorisation des huiles alimentaires usagées</p>' +
+    '<p>119 Route de La Varenne, 28270 Rueil La Gadelière | Tél: 06 10 25 10 63</p></div></div></body></html>';
+  const payload = {
+    sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' },
+    to: [{ email: to }],
+    subject: `UCO AND CO - Bordereau de collecte N° ${numeroOrdre}`,
+    htmlContent: html,
+    attachment: [{ content: pdfBuffer.toString('base64'), name: filename }]
+  };
+  const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json().catch(() => ({}));
+  return r.ok ? { sent: true, messageId: data.messageId } : { sent: false, error: data.message || ('Brevo HTTP ' + r.status) };
+}
+
+async function _sendBordereauSmsBrevo(tel, col, numeroOrdre) {
+  const settings = await getSettings();
+  if (!settings.brevoApiKey || !settings.smsEnabled) return { sent: false, error: 'SMS désactivé' };
+  let phone = typeof tel === 'object' ? tel.number : tel;
+  const cc = typeof tel === 'object' ? tel.countryCode : 'FR';
+  phone = String(phone || '').replace(/[\s.\-]/g, '');
+  if (!phone) return { sent: false, error: 'Téléphone vide' };
+  const prefixes = { FR: '+33', BE: '+32', CH: '+41', LU: '+352' };
+  const prefix = prefixes[cc] || '+33';
+  if (!phone.startsWith('+')) phone = phone.startsWith('0') ? prefix + phone.slice(1) : prefix + phone;
+  const content = `UCO AND CO: Collecte effectuée (${col.volume}L). Votre bordereau N°${numeroOrdre} vous a été envoyé par email et est disponible dans votre espace client.`.slice(0, 160);
+  const r = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+    method: 'POST',
+    headers: { 'accept': 'application/json', 'api-key': settings.brevoApiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ sender: 'UCOANDCO', recipient: phone, content })
+  });
+  const data = await r.json().catch(() => ({}));
+  return r.ok ? { sent: true } : { sent: false, error: data.message || ('Brevo SMS HTTP ' + r.status) };
+}
+
+// Travail de fond : PDF → persistance → email → SMS → statut
+async function _finalizeCollectionJob(colId, req) {
+  const coll = db.collection(COLLECTIONS.COLLECTIONS);
+  const setStatus = (patch) => coll.updateOne({ $or: [{ _id: colId }, { id: colId }] }, { $set: { finalize: patch, updatedAt: new Date().toISOString() } }).catch(() => {});
+  const startedAt = new Date().toISOString();
+  try {
+    const col = await coll.findOne({ $or: [{ _id: colId }, { id: colId }] });
+    if (!col) throw new Error('Collecte introuvable');
+
+    // Signatures : reconstruire depuis R2 si elles y ont été déportées
+    if (col._r2) {
+      for (const [field, info] of Object.entries(col._r2)) {
+        if (info?.r2Key && !col[field]) {
+          try {
+            const buf = await downloadFromR2(info.r2Key);
+            if (buf) col[field] = `data:${info.contentType || 'image/png'};base64,` + buf.toString('base64');
+          } catch (e) {}
+        }
+      }
+    }
+
+    // Restaurant : fiche complète en base (email/tel/gérant à jour), repli sur col.restaurant
+    let resto = null;
+    try {
+      const rid = col.restaurantId || col.restaurant?.id;
+      if (rid) resto = await db.collection(COLLECTIONS.RESTAURANTS).findOne(
+        { $or: [{ id: rid }, { qrCode: rid }] },
+        { projection: { password: 0, tempPassword: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }
+      );
+    } catch (e) {}
+    resto = { ...(col.restaurant || {}), ...(resto || {}) };
+
+    // 1. PDF
+    const { buffer, filename, numeroOrdre } = await _genBordereau(col, resto, { logoPng: _logoUcoPng });
+
+    // 2. Persistance (base64 en Mongo — même format que le frontend ; copie R2 si configuré)
+    const bordereau = { filename, base64: 'data:application/pdf;base64,' + buffer.toString('base64'), version: 3, source: 'server', dateGeneration: new Date().toISOString(), bytes: buffer.length };
+    try {
+      if (initS3()) { const key = await uploadToR2(`collections/${colId}/bordereau.pdf`, buffer.toString('base64'), 'application/pdf'); if (key) bordereau.r2Key = key; }
+    } catch (e) {}
+    await coll.updateOne({ $or: [{ _id: colId }, { id: colId }] }, { $set: { bordereau, numeroOrdre: col.numeroOrdre || numeroOrdre } });
+
+    // 3. Email avec PDF joint
+    let email = { sent: false, error: 'Pas d\'email restaurant' };
+    const to = (resto.email || col.restaurant?.email || '').trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+      try { email = await _sendBordereauEmailBrevo(to, col, numeroOrdre, buffer, filename); } catch (e) { email = { sent: false, error: e.message }; }
+    }
+
+    // 4. SMS (si activé)
+    let sms = { sent: false, error: 'non tenté' };
+    const tel = resto.tel || col.restaurant?.tel;
+    if (tel) { try { sms = await _sendBordereauSmsBrevo(tel, col, numeroOrdre); } catch (e) { sms = { sent: false, error: e.message }; } }
+
+    await setStatus({ status: 'done', startedAt, finishedAt: new Date().toISOString(), emailSent: !!email.sent, emailTo: email.sent ? to : null, emailError: email.error || null, smsSent: !!sms.sent, smsError: sms.sent ? null : (sms.error || null), pdfBytes: buffer.length, numeroOrdre });
+    await auditLog('COLLECTION_FINALIZED', colId, { emailSent: !!email.sent, smsSent: !!sms.sent, pdfBytes: buffer.length }, req);
+    console.log(`[FINALIZE] ${colId} OK — PDF ${Math.round(buffer.length / 1024)} Ko, email ${email.sent ? 'envoyé à ' + to : 'NON (' + email.error + ')'}, SMS ${sms.sent ? 'envoyé' : 'non'}`);
+  } catch (e) {
+    console.error('[FINALIZE] erreur', colId, e.message);
+    await setStatus({ status: 'error', startedAt, finishedAt: new Date().toISOString(), error: e.message });
+  }
+}
+
+app.post('/api/collections/:id/finalize', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    const colId = sanitizeInput(req.params.id);
+    const col = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ $or: [{ _id: colId }, { id: colId }] }, { projection: { finalize: 1, id: 1 } });
+    if (!col) return res.status(404).json({ success: false, error: 'Collecte non trouvee' });
+    const f = col.finalize;
+    const force = req.query.force === 'true';
+    if (!force && f?.status === 'running' && (Date.now() - new Date(f.startedAt).getTime()) < 120000) return res.status(202).json({ success: true, status: 'running' });
+    if (!force && f?.status === 'done') return res.json({ success: true, status: 'done', emailSent: !!f.emailSent, smsSent: !!f.smsSent });
+    await db.collection(COLLECTIONS.COLLECTIONS).updateOne({ $or: [{ _id: colId }, { id: colId }] }, { $set: { finalize: { status: 'running', startedAt: new Date().toISOString() } } });
+    res.status(202).json({ success: true, status: 'running' });
+    setImmediate(() => _finalizeCollectionJob(col.id || colId, req));
+  } catch (e) { console.error('Erreur finalize:', e.message); if (!res.headersSent) res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+
+app.get('/api/collections/:id/finalize', async (req, res) => {
+  try {
+    if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non connectee' });
+    const colId = sanitizeInput(req.params.id);
+    const col = await db.collection(COLLECTIONS.COLLECTIONS).findOne({ $or: [{ _id: colId }, { id: colId }] }, { projection: { finalize: 1, 'bordereau.filename': 1, 'bordereau.bytes': 1 } });
+    if (!col) return res.status(404).json({ success: false, error: 'Collecte non trouvee' });
+    res.json({ success: true, status: col.finalize?.status || 'none', ...(col.finalize || {}), hasBordereau: !!col.bordereau?.filename });
+  } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
+});
+// ===================== FIN [FINALIZE] =====================
+
 app.use((req, res) => { res.status(404).json({ success: false, error: 'Route non trouvee' }); });
 
 // [FIX OOM] Nettoyage periodique des tournees abandonnees (>48h)
