@@ -586,17 +586,20 @@ async function incrementLoginAttempts(collection, identifier) {
   if (!db || !isConnected) return;
   try {
     const update = { $inc: { loginAttempts: 1 } };
-    const user = await db.collection(collection).findOne({ email: identifier });
-    if (user && user.loginAttempts >= MAX_LOGIN_ATTEMPTS - 1) {
+    const user = await findOneByEmailCI(collection, identifier); // [FIX 10/2026] insensible a la casse
+    if (!user) return;
+    if (user.loginAttempts >= MAX_LOGIN_ATTEMPTS - 1) {
       update.$set = { lockUntil: new Date(Date.now() + LOCK_TIME).toISOString() };
     }
-    await db.collection(collection).updateOne({ email: identifier }, update);
+    await db.collection(collection).updateOne({ email: user.email }, update);
   } catch (e) { console.error('Erreur incrementLoginAttempts:', e.message); }
 }
 async function resetLoginAttempts(collection, identifier) {
   if (!db || !isConnected) return;
   try {
-    await db.collection(collection).updateOne({ email: identifier }, { $set: { loginAttempts: 0, lockUntil: null } });
+    const user = await findOneByEmailCI(collection, identifier); // [FIX 10/2026]
+    if (!user) return;
+    await db.collection(collection).updateOne({ email: user.email }, { $set: { loginAttempts: 0, lockUntil: null } });
   } catch (e) { console.error('Erreur resetLoginAttempts:', e.message); }
 }
 // =============================================
@@ -836,12 +839,13 @@ app.get('/api/bulk-data', async (req, res) => {
     const limit = parseInt(req.query.limit) || 500;
     const [restaurants, pendingRestaurants, collections, pendingCollectors, approvedCollectors, pendingOperators, approvedOperators, expeditions, avisClients, adminSettings] = await Promise.all([
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'deleted' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(limit).toArray().catch(() => []),
-      db.collection(COLLECTIONS.PENDING_RESTAURANTS).find({}, { projection: { password: 0 } }).limit(limit).toArray().catch(() => []),
+      // [FIX 10/2026] Les "pending_*" / "approved_*" n'existent pas : une seule collection par profil, filtree par status
+      db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0 } }).limit(limit).toArray().catch(() => []),
       db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0, 'bordereau.base64': 0, 'autoFacture.base64': 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
-      db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
-      db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray().catch(() => []),
-      db.collection(COLLECTIONS.PENDING_OPERATORS || 'pending_operators').find({}).limit(100).toArray().catch(() => []),
-      db.collection(COLLECTIONS.APPROVED_OPERATORS || 'approved_operators').find({}).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.COLLECTORS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0 } }).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.COLLECTORS).find({ status: 'approved' }, { projection: { password: 0 } }).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.OPERATORS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0 } }).limit(100).toArray().catch(() => []),
+      db.collection(COLLECTIONS.OPERATORS).find({ status: 'approved' }, { projection: { password: 0 } }).limit(100).toArray().catch(() => []),
       db.collection(COLLECTIONS.EXPEDITIONS).find({}, { projection: { bsdPdfBase64: 0, 'bsdCerfa.base64': 0 } }).sort({ date: -1 }).limit(limit).toArray().catch(() => []),
       db.collection('avis_clients').find({}).sort({ date: -1 }).limit(100).toArray().catch(() => []),
       db.collection('admin_settings').findOne({ id: 'main' }).catch(() => null)
@@ -876,10 +880,11 @@ app.get('/api/bulk-load', async (req, res) => {
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: { $ne: 'pending' } }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(500).toArray(),
       db.collection(COLLECTIONS.RESTAURANTS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0, contratPDF: 0, 'contrat.base64': 0, 'signatures.admin': 0, 'signatures.restaurant': 0, adminSignatureData: 0, tamponData: 0 } }).limit(100).toArray(),
       db.collection(COLLECTIONS.COLLECTIONS).find({}, { projection: { bsdPdfBase64: 0, colSignature: 0, restoSignature: 0, signatureData: 0, 'bordereau.base64': 0, 'autoFacture.base64': 0 } }).sort({ date: -1 }).limit(2000).toArray(),
-      db.collection(COLLECTIONS.PENDING_COLLECTORS).find({}).limit(100).toArray(),
-      db.collection(COLLECTIONS.APPROVED_COLLECTORS).find({}).limit(100).toArray(),
-      db.collection('pending_operators').find({}).limit(100).toArray(),
-      db.collection('approved_operators').find({}).limit(100).toArray(),
+      // [FIX 10/2026] Collections reelles filtrees par status (les "pending_*" n'existaient pas -> bulk-load echouait toujours)
+      db.collection(COLLECTIONS.COLLECTORS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0 } }).limit(100).toArray(),
+      db.collection(COLLECTIONS.COLLECTORS).find({ status: 'approved' }, { projection: { password: 0 } }).limit(100).toArray(),
+      db.collection(COLLECTIONS.OPERATORS).find({ status: 'pending' }, { projection: { password: 0, loginAttempts: 0, lockUntil: 0 } }).limit(100).toArray(),
+      db.collection(COLLECTIONS.OPERATORS).find({ status: 'approved' }, { projection: { password: 0 } }).limit(100).toArray(),
       db.collection(COLLECTIONS.EXPEDITIONS).find({}, { projection: { bsdPdfBase64: 0, 'bsdCerfa.base64': 0 } }).sort({ date: -1 }).limit(500).toArray(),
       db.collection('demandes_collecte').find({ status: { $in: ['pending', 'accepted'] } }).limit(200).toArray()
     ]);
@@ -1979,17 +1984,33 @@ async function sendResetSMS(to, code) {
   } catch (e) { return false; }
 }
 
+// [FIX 10/2026] Mode "auto" : le client ne connait pas le profil de l'utilisateur.
+// Cherche l'email dans les 6 collections et renvoie { coll, user } (ou null).
+// Evite 6 appels cote client (le strictLimiter n'en autorise que 10/h).
+async function findUserAnyRole(email) {
+  for (const coll of Object.values(RESET_COLL_MAP)) {
+    const user = await findOneByEmailCI(coll, email);
+    if (user) return { coll, user };
+  }
+  return null;
+}
+async function resolveResetTarget(role, email) {
+  if (role === 'auto') { const f = await findUserAnyRole(email); return f ? f : { coll: null, user: null }; }
+  const coll = RESET_COLL_MAP[role];
+  if (!coll) return { coll: undefined, user: null };
+  return { coll, user: await findOneByEmailCI(coll, email) };
+}
+
 // ÉTAPE 1 — Demander un code : le serveur génère, stocke (hashé), envoie
 app.post('/api/password-reset/:role/request', async (req, res) => {
   try {
     const { role } = req.params;
     const { email, method } = sanitizeObject(req.body);
-    const coll = RESET_COLL_MAP[role];
-    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (role !== 'auto' && !RESET_COLL_MAP[role]) return res.status(400).json({ success: false, error: 'Role invalide' });
     if (!email) return res.status(400).json({ success: false, error: 'Email requis' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await findOneByEmailCI(coll, email);
+    const { coll, user } = await resolveResetTarget(role, email);
     // Réponse identique que le compte existe ou non (anti-énumération)
     const genericOk = { success: true, message: 'Si un compte existe, un code a été envoyé.' };
     if (!user) return res.json(genericOk);
@@ -1997,13 +2018,14 @@ app.post('/api/password-reset/:role/request', async (req, res) => {
     const code = String(Math.floor(100000 + Math.random() * 900000));
     const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
     const expires = Date.now() + 15 * 60 * 1000;
-    await db.collection(coll).updateOne({ email }, { $set: { resetCodeHash: codeHash, resetCodeExpires: expires, resetCodeAttempts: 0 } });
+    // [FIX 10/2026] Ecrire sur l'email tel qu'en base (findOneByEmailCI ignore la casse, updateOne non)
+    await db.collection(coll).updateOne({ email: user.email }, { $set: { resetCodeHash: codeHash, resetCodeExpires: expires, resetCodeAttempts: 0 } });
 
     let sent = false;
     if (method === 'sms' && user.tel) sent = await sendResetSMS(user.tel, code);
     else sent = await sendResetEmail(email, code);
 
-    await auditLog(role.toUpperCase() + '_RESET_REQUEST', email, { method: method || 'email', sent }, req);
+    await auditLog((role === 'auto' ? String(coll) : role).toUpperCase() + '_RESET_REQUEST', email, { method: method || 'email', sent }, req);
     // On ne divulgue jamais le code dans la réponse
     return res.json(genericOk);
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
@@ -2014,19 +2036,18 @@ app.post('/api/password-reset/:role/verify', async (req, res) => {
   try {
     const { role } = req.params;
     const { email, code } = sanitizeObject(req.body);
-    const coll = RESET_COLL_MAP[role];
-    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (role !== 'auto' && !RESET_COLL_MAP[role]) return res.status(400).json({ success: false, error: 'Role invalide' });
     if (!email || !code) return res.status(400).json({ success: false, error: 'Email et code requis' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await findOneByEmailCI(coll, email);
+    const { coll, user } = await resolveResetTarget(role, email);
     if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
 
     const valid = await bcrypt.compare(code, user.resetCodeHash);
     if (!valid) {
-      await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } });
+      await db.collection(coll).updateOne({ email: user.email }, { $inc: { resetCodeAttempts: 1 } });
       return res.status(401).json({ success: false, error: 'Code incorrect' });
     }
     return res.json({ success: true });
@@ -2038,29 +2059,28 @@ app.post('/api/password-reset/:role/confirm', async (req, res) => {
   try {
     const { role } = req.params;
     const { email, code, newPassword } = sanitizeObject(req.body);
-    const coll = RESET_COLL_MAP[role];
-    if (!coll) return res.status(400).json({ success: false, error: 'Role invalide' });
+    if (role !== 'auto' && !RESET_COLL_MAP[role]) return res.status(400).json({ success: false, error: 'Role invalide' });
     if (!email || !code || !newPassword) return res.status(400).json({ success: false, error: 'Email, code et nouveau mot de passe requis' });
     if (newPassword.length < 8) return res.status(400).json({ success: false, error: 'Mot de passe trop court (8 caractères min)' });
     if (!db || !isConnected) return res.status(503).json({ success: false, error: 'DB non disponible' });
 
-    const user = await findOneByEmailCI(coll, email);
+    const { coll, user } = await resolveResetTarget(role, email);
     if (!user || !user.resetCodeHash) return res.status(400).json({ success: false, error: 'Aucune demande en cours' });
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives, recommencez' });
 
     const valid = await bcrypt.compare(code, user.resetCodeHash);
     if (!valid) {
-      await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } });
+      await db.collection(coll).updateOne({ email: user.email }, { $inc: { resetCodeAttempts: 1 } });
       return res.status(401).json({ success: false, error: 'Code incorrect' });
     }
 
     // Code OK → changer le mot de passe ET invalider le code (à usage unique)
-    await db.collection(coll).updateOne({ email }, {
+    await db.collection(coll).updateOne({ email: user.email }, {
       $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
       $unset: { resetCodeHash: '', resetCodeExpires: '', resetCodeAttempts: '', tempPassword: '', _tempPassword: '' }
     });
-    await auditLog(role.toUpperCase() + '_PASSWORD_RESET', email, { via: 'code_verifie_serveur' }, req);
+    await auditLog((role === 'auto' ? String(coll) : role).toUpperCase() + '_PASSWORD_RESET', email, { via: 'code_verifie_serveur' }, req);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: 'Erreur serveur' }); }
 });
@@ -2084,8 +2104,8 @@ app.post('/api/password-reset/:role', async (req, res) => {
     if (Date.now() > (user.resetCodeExpires || 0)) return res.status(400).json({ success: false, error: 'Code expiré, recommencez' });
     if ((user.resetCodeAttempts || 0) >= 5) return res.status(429).json({ success: false, error: 'Trop de tentatives' });
     const valid = await bcrypt.compare(code, user.resetCodeHash);
-    if (!valid) { await db.collection(coll).updateOne({ email }, { $inc: { resetCodeAttempts: 1 } }); return res.status(401).json({ success: false, error: 'Code incorrect' }); }
-    await db.collection(coll).updateOne({ email }, {
+    if (!valid) { await db.collection(coll).updateOne({ email: user.email }, { $inc: { resetCodeAttempts: 1 } }); return res.status(401).json({ success: false, error: 'Code incorrect' }); }
+    await db.collection(coll).updateOne({ email: user.email }, {
       $set: { password: await bcrypt.hash(newPassword, BCRYPT_ROUNDS), passwordChangedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
       $unset: { resetCodeHash: '', resetCodeExpires: '', resetCodeAttempts: '', tempPassword: '', _tempPassword: '' }
     });
