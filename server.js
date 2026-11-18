@@ -345,7 +345,7 @@ const initialData = {
       google: '',
       instagram: '',
       facebook: '',
-      whatsapp: '+33610251063',
+      whatsapp: '+33768411999',
       linkedin: '',
       tripadvisor: ''
     }
@@ -2814,7 +2814,7 @@ async function _sendBordereauEmailBrevo(to, col, numeroOrdre, pdfBuffer, filenam
     '<p>Votre bordereau d\'enlèvement signé est joint à cet email (PDF) et reste disponible dans votre espace client.</p>' +
     '<p>Merci de votre confiance.</p><p>L\'équipe UCO AND CO</p></div>' +
     '<div style="background:#333;color:white;padding:15px;text-align:center;font-size:12px;"><p>UCO AND CO - Collecte et valorisation des huiles alimentaires usagées</p>' +
-    '<p>119 Route de La Varenne, 28270 Rueil La Gadelière | Tél: 06 10 25 10 63</p></div></div></body></html>';
+    '<p>119 Route de La Varenne, 28270 Rueil La Gadelière | Tél: 07 68 41 19 99</p></div></div></body></html>';
   const payload = {
     sender: { name: 'UCO AND CO', email: 'contact@uco-and-co.fr' },
     to: [{ email: to }],
